@@ -111,12 +111,14 @@ def log_summary(label: str, df: pd.DataFrame) -> None:
     logger.info("  [%s] Shape: %s", label, df.shape)
 
 
-def drop_fully_empty_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def drop_rows_with_any_missing(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Entfernt jede Zeile, die in mindestens einer Spalte einen leeren Wert hat."""
     before = len(df)
-    df = df.dropna(how="all")
+    # Leere Strings ebenfalls als fehlend behandeln
+    df = df.replace(r"^\s*$", np.nan, regex=True)
+    df = df.dropna(how="any")
     removed = before - len(df)
-    if removed:
-        logger.warning("  Vollstaendig leere Zeilen entfernt: %d", removed)
+    logger.warning("  Zeilen mit mind. einem fehlenden Wert entfernt: %d", removed)
     return df, removed
 
 
@@ -147,32 +149,16 @@ def convert_numeric(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 def handle_missing_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """
-    Strategie:
-      - Container-optionale Felder: NaN ist akzeptabel (kein Containertransport).
-      - Numerische Pflichtfelder (Tonnen): Zeilen mit NaN entfernen.
-      - Kategoriale Code-Felder: Mit 'UNBEKANNT' auffuellen und protokollieren.
-    """
+    """Keine Auffuellung mehr – fehlende Werte wurden bereits durch
+    drop_rows_with_any_missing vollstaendig entfernt. Funktion protokolliert
+    nur noch verbliebene NaN-Werte als Kontrolle."""
     report = {}
-
-    # Zeilen ohne Tonnen-Angabe entfernen
-    if "Tonnen" in df.columns:
-        before = len(df)
-        df = df.dropna(subset=["Tonnen"])
-        removed = before - len(df)
-        if removed:
-            logger.warning("  Zeilen ohne 'Tonnen'-Wert entfernt: %d", removed)
-            report["Tonnen_removed"] = removed
-
-    # Kategoriale Code-Spalten auffuellen
-    cat_cols = [c for c in df.columns if c not in NUMERIC_COLS + CONTAINER_OPTIONAL]
-    for col in cat_cols:
-        n_miss = df[col].isna().sum()
-        if n_miss:
-            df[col] = df[col].fillna("UNBEKANNT")
-            logger.info("  '%s': %d fehlende Werte → 'UNBEKANNT'", col, n_miss)
-            report[col] = int(n_miss)
-
+    total_na = int(df.isna().sum().sum())
+    if total_na:
+        logger.warning("  Verbliebene NaN-Werte nach Drop: %d (unerwartet)", total_na)
+        report["verbleibende_nan"] = total_na
+    else:
+        logger.info("  Keine fehlenden Werte verblieben.")
     return df, report
 
 
@@ -271,9 +257,9 @@ def clean_file(path: Path) -> dict:
     df = read_csv(path)
     cleaning_report["initial_shape"] = list(df.shape)
 
-    # 2 – Vollstaendig leere Zeilen
-    df, n_empty = drop_fully_empty_rows(df)
-    cleaning_report["steps"]["leere_zeilen_entfernt"] = n_empty
+    # 2 – Alle Zeilen mit mind. einem fehlenden Wert entfernen
+    df, n_empty = drop_rows_with_any_missing(df)
+    cleaning_report["steps"]["zeilen_mit_fehlenden_werten_entfernt"] = n_empty
 
     # 3 – Pflichtfelder pruefen
     validate_required_cols(df, path.name)
