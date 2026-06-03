@@ -246,8 +246,8 @@ def validate_iso_codes(df: pd.DataFrame) -> dict:
 # Haupt-Pipeline
 # ---------------------------------------------------------------------------
 
-def clean_file(path: Path) -> dict:
-    """Bereinigt eine einzelne CSV-Datei und speichert das Ergebnis."""
+def clean_file(path: Path) -> tuple[pd.DataFrame, dict]:
+    """Bereinigt eine einzelne CSV-Datei und gibt den DataFrame + Report zurueck."""
     logger.info("=" * 70)
     logger.info("Datei: %s", path.name)
 
@@ -271,7 +271,7 @@ def clean_file(path: Path) -> dict:
     df, conv_errors = convert_numeric(df)
     cleaning_report["steps"]["konvertierungsfehler"] = conv_errors
 
-    # 6 – Fehlende Werte behandeln
+    # 6 – Fehlende Werte kontrollieren
     df, missing_report = handle_missing_values(df)
     cleaning_report["steps"]["fehlende_werte"] = missing_report
 
@@ -291,16 +291,13 @@ def clean_file(path: Path) -> dict:
     outlier_report = detect_outliers_iqr(df)
     cleaning_report["steps"]["ausreisser"] = outlier_report
 
-    # Abschlussbericht
+    # Herkunftsspalte hinzufuegen
+    df.insert(0, "Quelldatei", path.name)
+
     cleaning_report["final_shape"] = list(df.shape)
     log_summary("Ergebnis", df)
 
-    # Speichern
-    out_path = OUTPUT_DIR / path.name
-    df.to_csv(out_path, sep=";", encoding="utf-8-sig", decimal=",", index=False)
-    logger.info("  Gespeichert: %s", out_path)
-
-    return cleaning_report
+    return df, cleaning_report
 
 
 def run() -> None:
@@ -318,21 +315,54 @@ def run() -> None:
     logger.info("Starte Bereinigung von %d Datei(en).", len(csv_files))
 
     all_reports = []
+    cleaned_frames = []
+
     for csv_path in csv_files:
         try:
-            report = clean_file(csv_path)
+            df_clean, report = clean_file(csv_path)
+            cleaned_frames.append(df_clean)
             all_reports.append(report)
         except Exception as exc:
             logger.error("Fehler bei '%s': %s", csv_path.name, exc, exc_info=True)
 
-    # Gesamt-Report als JSON speichern
+    # Kombinierten Datensatz erstellen und speichern
+    if cleaned_frames:
+        combined = pd.concat(cleaned_frames, ignore_index=True)
+
+        # Globale Duplikate (ueber alle Dateien) nochmals entfernen
+        before = len(combined)
+        combined = combined.drop_duplicates(
+            subset=[c for c in combined.columns if c != "Quelldatei"]
+        )
+        n_global_dupes = before - len(combined)
+        if n_global_dupes:
+            logger.warning("  Dateiuebergreifende Duplikate entfernt: %d", n_global_dupes)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = OUTPUT_DIR / f"seeverkehr_bereinigt_{timestamp}.csv"
+        combined.to_csv(out_path, sep=";", encoding="utf-8-sig", decimal=",", index=False)
+
+        logger.info("=" * 70)
+        logger.info("Kombinierter Datensatz: %d Zeilen, %d Spalten", *combined.shape)
+        logger.info("Gespeichert: %s", out_path)
+
+        # Gesamtstatistik in Report aufnehmen
+        all_reports.append({
+            "combined": {
+                "dateien": len(cleaned_frames),
+                "zeilen_gesamt": int(combined.shape[0]),
+                "spalten": int(combined.shape[1]),
+                "dateiuebergreifende_duplikate_entfernt": n_global_dupes,
+                "ausgabedatei": out_path.name,
+            }
+        })
+
+    # Report als JSON speichern
     report_path = LOG_DIR / f"cleaning_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(all_reports, f, ensure_ascii=False, indent=2)
 
-    logger.info("=" * 70)
-    logger.info("Abgeschlossen. Report: %s", report_path)
-    logger.info("Bereinigte Dateien: %s", OUTPUT_DIR)
+    logger.info("Report: %s", report_path)
 
 
 if __name__ == "__main__":
