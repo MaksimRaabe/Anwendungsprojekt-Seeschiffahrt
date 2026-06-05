@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # Numerische Spalten mit Dezimalkomma
 NUMERIC_COLS = ["Tonnen", "TEU", "Anzahl_Ladungstraeger"]
 
+# Spalten-Aliases zwischen unterschiedlichen Datensatz-Versionen
+# (z.B. Destatis nutzt teils 'Guetergewicht' statt 'Tonnen')
+COLUMN_ALIASES = {
+    "Guetergewicht": "Tonnen",
+}
+
 # Spalten, die nur fehlend sein duerfen, wenn kein Containertransport vorliegt
 CONTAINER_OPTIONAL = [
     "Container_Ladezustand",
@@ -94,16 +100,54 @@ REQUIRED_COLS = [
 
 def read_csv(path: Path) -> pd.DataFrame:
     """Liest eine Destatis-CSV (UTF-8-BOM, Semikolon, Dezimalkomma)."""
-    df = pd.read_csv(
-        path,
-        sep=";",
-        encoding="utf-8-sig",   # utf-8 mit BOM
-        decimal=",",
-        dtype=str,               # erstmal alles als String einlesen
-        low_memory=False,
-    )
-    df.columns = df.columns.str.strip()
+    if not path.exists():
+        raise FileNotFoundError(f"CSV nicht gefunden: {path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Pfad ist keine Datei (sondern Ordner?): {path}")
+
+    # Erst schnell/streng lesen (C-Engine). Falls einzelne Zeilen kaputt sind,
+    # versuchen wir einen toleranteren Fallback.
+    try:
+        df = pd.read_csv(
+            path,
+            sep=";",
+            encoding="utf-8-sig",   # utf-8 mit BOM
+            decimal=",",
+            dtype=str,               # erstmal alles als String einlesen
+            low_memory=False,
+        )
+    except pd.errors.ParserError as exc:
+        logger.warning(
+            "  ParserError beim Einlesen (%s). Fallback: python-engine + on_bad_lines='warn'.",
+            exc,
+        )
+        df = pd.read_csv(
+            path,
+            sep=";",
+            encoding="utf-8-sig",
+            decimal=",",
+            dtype=str,
+            low_memory=False,
+            engine="python",
+            on_bad_lines="warn",
+        )
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Zugriff verweigert auf {path}. Datei ggf. in Excel/DataWrangler geoeffnet?"
+        ) from exc
+
+    df = normalize_schema(df)
     logger.info("  Eingelesen: %d Zeilen, %d Spalten", len(df), len(df.columns))
+    return df
+
+
+def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Vereinheitlicht Spaltennamen ueber unterschiedliche Datei-Versionen."""
+    df.columns = df.columns.str.strip()
+    present = set(df.columns)
+    for old, new in COLUMN_ALIASES.items():
+        if old in present and new not in present:
+            df = df.rename(columns={old: new})
     return df
 
 
@@ -111,14 +155,34 @@ def log_summary(label: str, df: pd.DataFrame) -> None:
     logger.info("  [%s] Shape: %s", label, df.shape)
 
 
-def drop_rows_with_any_missing(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Entfernt jede Zeile, die in mindestens einer Spalte einen leeren Wert hat."""
+REQUIRED_FOR_ROW = [
+    "EVAS",
+    "Referenzzeitraum_Jahr",
+    "Referenzzeitraum_Monat",
+    "Einladeregion_ISO",
+    "Ausladeregion_ISO",
+    "Verkehrsbeziehung",
+    "Schiffsart",
+    "Flagge",
+    "NST2007",
+    "Tonnen",
+]
+
+
+def drop_rows_missing_required(df: pd.DataFrame, required: list[str]) -> tuple[pd.DataFrame, int]:
+    """Entfernt nur Zeilen, bei denen Kernspalten fehlen (statt jede NA irgendwo)."""
     before = len(df)
     # Leere Strings ebenfalls als fehlend behandeln
     df = df.replace(r"^\s*$", np.nan, regex=True)
-    df = df.dropna(how="any")
+
+    required_present = [c for c in required if c in df.columns]
+    if not required_present:
+        logger.warning("  Keine der REQUIRED_FOR_ROW-Spalten im DataFrame gefunden; kein Drop ausgefuehrt.")
+        return df, 0
+
+    df = df.dropna(subset=required_present)
     removed = before - len(df)
-    logger.warning("  Zeilen mit mind. einem fehlenden Wert entfernt: %d", removed)
+    logger.warning("  Zeilen mit fehlenden Kernfeldern entfernt: %d", removed)
     return df, removed
 
 
@@ -149,16 +213,34 @@ def convert_numeric(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 def handle_missing_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Keine Auffuellung mehr – fehlende Werte wurden bereits durch
-    drop_rows_with_any_missing vollstaendig entfernt. Funktion protokolliert
-    nur noch verbliebene NaN-Werte als Kontrolle."""
-    report = {}
-    total_na = int(df.isna().sum().sum())
-    if total_na:
-        logger.warning("  Verbliebene NaN-Werte nach Drop: %d (unerwartet)", total_na)
-        report["verbleibende_nan"] = total_na
-    else:
+    """Protokolliert fehlende Werte.
+
+    Wichtig: Seitdem nur noch Zeilen mit fehlenden *Kernfeldern* entfernt werden,
+    sind NaN in optionalen Spalten (z.B. Container-Merkmale) normal und sollen
+    nicht als Fehler bewertet werden.
+    """
+    report: dict = {}
+
+    na_per_col = df.isna().sum()
+    total_na = int(na_per_col.sum())
+    report["na_total"] = total_na
+
+    if total_na == 0:
         logger.info("  Keine fehlenden Werte verblieben.")
+        return df, report
+
+    # Nur Top-N Spalten reporten, damit JSON/Logs nicht explodieren.
+    top_n = 10
+    na_top = na_per_col[na_per_col > 0].sort_values(ascending=False).head(top_n)
+    report["na_top_cols"] = {k: int(v) for k, v in na_top.items()}
+
+    # Extra: optionalen Container-Block gesondert ausweisen
+    container_cols_present = [c for c in CONTAINER_OPTIONAL if c in df.columns]
+    if container_cols_present:
+        container_na = int(df[container_cols_present].isna().sum().sum())
+        report["na_container_optional_total"] = container_na
+
+    logger.info("  Fehlende Werte gesamt: %d (Top-%d Spalten im Report)", total_na, top_n)
     return df, report
 
 
@@ -222,7 +304,8 @@ def remove_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
-    str_cols = df.select_dtypes(include="object").columns
+    # Explizit object+string angeben (Pandas 3/4 Kompatibilitaet)
+    str_cols = df.select_dtypes(include=["object", "string"]).columns
     df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
     return df
 
@@ -257,9 +340,9 @@ def clean_file(path: Path) -> tuple[pd.DataFrame, dict]:
     df = read_csv(path)
     cleaning_report["initial_shape"] = list(df.shape)
 
-    # 2 – Alle Zeilen mit mind. einem fehlenden Wert entfernen
-    df, n_empty = drop_rows_with_any_missing(df)
-    cleaning_report["steps"]["zeilen_mit_fehlenden_werten_entfernt"] = n_empty
+    # 2 – Nur Zeilen entfernen, in denen Kernfelder fehlen
+    df, n_missing_required = drop_rows_missing_required(df, REQUIRED_FOR_ROW)
+    cleaning_report["steps"]["zeilen_mit_fehlenden_kernfeldern_entfernt"] = n_missing_required
 
     # 3 – Pflichtfelder pruefen
     validate_required_cols(df, path.name)
