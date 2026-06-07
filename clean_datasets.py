@@ -106,6 +106,91 @@ NUTS3_COL_ISO_MAP = {
     "Einladeregion_NUTS3_Label": "Einladeregion_ISO",
 }
 
+# Mapping ISO-2 → uebergeordnete Makroregion fuer Zeilen ohne NUTS3-Code.
+# Wird fuer Auslade- und Einladeregion gleichermassen verwendet.
+ISO_TO_MAKROREGION: dict[str, str] = {
+    # Europa – EU/EEA (haben NUTS3, werden trotzdem einheitlich gemappt)
+    "AT": "Europa (EU/EEA)", "BE": "Europa (EU/EEA)", "BG": "Europa (EU/EEA)",
+    "CY": "Europa (EU/EEA)", "CZ": "Europa (EU/EEA)", "DE": "Europa (EU/EEA)",
+    "DK": "Europa (EU/EEA)", "EE": "Europa (EU/EEA)", "ES": "Europa (EU/EEA)",
+    "FI": "Europa (EU/EEA)", "FR": "Europa (EU/EEA)", "GR": "Europa (EU/EEA)",
+    "HR": "Europa (EU/EEA)", "HU": "Europa (EU/EEA)", "IE": "Europa (EU/EEA)",
+    "IT": "Europa (EU/EEA)", "LT": "Europa (EU/EEA)", "LU": "Europa (EU/EEA)",
+    "LV": "Europa (EU/EEA)", "MT": "Europa (EU/EEA)", "NL": "Europa (EU/EEA)",
+    "PL": "Europa (EU/EEA)", "PT": "Europa (EU/EEA)", "RO": "Europa (EU/EEA)",
+    "SE": "Europa (EU/EEA)", "SI": "Europa (EU/EEA)", "SK": "Europa (EU/EEA)",
+    "NO": "Europa (EU/EEA)", "IS": "Europa (EU/EEA)", "LI": "Europa (EU/EEA)",
+    # Europa – nicht EU/EEA
+    "GB": "Europa (nicht EU/EEA)", "CH": "Europa (nicht EU/EEA)",
+    "TR": "Europa (nicht EU/EEA)", "BA": "Europa (nicht EU/EEA)",
+    "RS": "Europa (nicht EU/EEA)", "ME": "Europa (nicht EU/EEA)",
+    "MK": "Europa (nicht EU/EEA)", "AL": "Europa (nicht EU/EEA)",
+    "XK": "Europa (nicht EU/EEA)", "MC": "Europa (nicht EU/EEA)",
+    "AD": "Europa (nicht EU/EEA)", "SM": "Europa (nicht EU/EEA)",
+    # Osteuropa / GUS
+    "RU": "Osteuropa/GUS", "UA": "Osteuropa/GUS", "BY": "Osteuropa/GUS",
+    "MD": "Osteuropa/GUS", "GE": "Osteuropa/GUS", "AM": "Osteuropa/GUS",
+    "AZ": "Osteuropa/GUS", "KZ": "Osteuropa/GUS", "UZ": "Osteuropa/GUS",
+    "TM": "Osteuropa/GUS", "KG": "Osteuropa/GUS", "TJ": "Osteuropa/GUS",
+    # Nordafrika
+    "MA": "Nordafrika", "DZ": "Nordafrika", "TN": "Nordafrika",
+    "LY": "Nordafrika", "EG": "Nordafrika",
+    # Westafrika
+    "SN": "Westafrika", "GM": "Westafrika", "GN": "Westafrika",
+    "GW": "Westafrika", "SL": "Westafrika", "LR": "Westafrika",
+    "CI": "Westafrika", "GH": "Westafrika", "TG": "Westafrika",
+    "BJ": "Westafrika", "NG": "Westafrika", "CM": "Westafrika",
+    "GA": "Westafrika", "CG": "Westafrika", "CD": "Westafrika",
+    "AO": "Westafrika", "CV": "Westafrika", "ST": "Westafrika",
+    "GQ": "Westafrika",
+    # Ost- und Suedafrika
+    "TZ": "Ost-/Suedafrika", "KE": "Ost-/Suedafrika", "MZ": "Ost-/Suedafrika",
+    "MG": "Ost-/Suedafrika", "ZA": "Ost-/Suedafrika", "NA": "Ost-/Suedafrika",
+    "MU": "Ost-/Suedafrika", "DJ": "Ost-/Suedafrika", "SO": "Ost-/Suedafrika",
+    "ER": "Ost-/Suedafrika", "ET": "Ost-/Suedafrika", "SD": "Ost-/Suedafrika",
+    "SS": "Ost-/Suedafrika", "RE": "Ost-/Suedafrika", "ZM": "Ost-/Suedafrika",
+    "ZW": "Ost-/Suedafrika", "MW": "Ost-/Suedafrika", "BI": "Ost-/Suedafrika",
+    "RW": "Ost-/Suedafrika", "UG": "Ost-/Suedafrika", "KM": "Ost-/Suedafrika",
+    "SC": "Ost-/Suedafrika",
+    # Naher Osten
+    "SA": "Naher Osten", "AE": "Naher Osten", "QA": "Naher Osten",
+    "KW": "Naher Osten", "OM": "Naher Osten", "BH": "Naher Osten",
+    "YE": "Naher Osten", "IR": "Naher Osten", "IQ": "Naher Osten",
+    "IL": "Naher Osten", "JO": "Naher Osten", "SY": "Naher Osten",
+    "LB": "Naher Osten",
+    # Suedasien
+    "IN": "Suedasien", "PK": "Suedasien", "BD": "Suedasien",
+    "LK": "Suedasien", "MM": "Suedasien", "MV": "Suedasien",
+    # Ostasien
+    "CN": "Ostasien", "JP": "Ostasien", "KR": "Ostasien",
+    "HK": "Ostasien", "TW": "Ostasien", "MO": "Ostasien",
+    # Suedostasien
+    "SG": "Suedostasien", "TH": "Suedostasien", "VN": "Suedostasien",
+    "ID": "Suedostasien", "MY": "Suedostasien", "PH": "Suedostasien",
+    "KH": "Suedostasien", "BN": "Suedostasien", "TL": "Suedostasien",
+    # Nordamerika
+    "US": "Nordamerika", "CA": "Nordamerika", "MX": "Nordamerika",
+    "PR": "Nordamerika", "BM": "Nordamerika", "VI": "Nordamerika",
+    # Mittelamerika / Karibik
+    "PA": "Mittelamerika/Karibik", "CR": "Mittelamerika/Karibik",
+    "GT": "Mittelamerika/Karibik", "HN": "Mittelamerika/Karibik",
+    "NI": "Mittelamerika/Karibik", "SV": "Mittelamerika/Karibik",
+    "BZ": "Mittelamerika/Karibik", "CU": "Mittelamerika/Karibik",
+    "JM": "Mittelamerika/Karibik", "HT": "Mittelamerika/Karibik",
+    "DO": "Mittelamerika/Karibik", "TT": "Mittelamerika/Karibik",
+    "BB": "Mittelamerika/Karibik", "BS": "Mittelamerika/Karibik",
+    "AW": "Mittelamerika/Karibik", "CW": "Mittelamerika/Karibik",
+    # Suedamerika
+    "BR": "Suedamerika", "AR": "Suedamerika", "CL": "Suedamerika",
+    "CO": "Suedamerika", "PE": "Suedamerika", "VE": "Suedamerika",
+    "EC": "Suedamerika", "UY": "Suedamerika", "GY": "Suedamerika",
+    "SR": "Suedamerika", "GF": "Suedamerika",
+    # Ozeanien
+    "AU": "Ozeanien", "NZ": "Ozeanien", "FJ": "Ozeanien",
+    "PG": "Ozeanien", "PF": "Ozeanien", "NC": "Ozeanien",
+    "GU": "Ozeanien",
+}
+
 # Erwartete Wertebereich-Pruefungen (Code-Spalten)
 FIELD_CONSTRAINTS = {
     "Referenzzeitraum_Monat": (1, 12),
@@ -508,6 +593,37 @@ def validate_iso_codes(df: pd.DataFrame) -> dict:
     return report
 
 
+def derive_makroregion_cols(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Leitet Ausladeregion_Makroregion und Einladeregion_Makroregion aus den ISO-Codes ab.
+
+    Die Spalten werden fuer alle Zeilen gesetzt – auch fuer EU/EEA-Haefen, damit
+    Analysen einheitlich auf Makroregion-Ebene moeglich sind, ohne auf NUTS3 angewiesen
+    zu sein. Unbekannte ISO-Codes bleiben NaN und werden im Report ausgewiesen.
+    """
+    report: dict = {}
+    for iso_col, target_col in [
+        ("Ausladeregion_ISO", "Ausladeregion_Makroregion"),
+        ("Einladeregion_ISO", "Einladeregion_Makroregion"),
+    ]:
+        if iso_col not in df.columns:
+            continue
+        df[target_col] = df[iso_col].map(ISO_TO_MAKROREGION)
+        n_mapped = int(df[target_col].notna().sum())
+        n_unmapped = int(df[target_col].isna().sum())
+        report[target_col] = {"gemappt": n_mapped, "ungemappt": n_unmapped}
+        if n_unmapped:
+            unknown = sorted(df.loc[df[target_col].isna(), iso_col].dropna().unique())
+            logger.warning(
+                "  %s: %d Zeilen ohne Makroregion-Mapping (ISO-Codes: %s%s)",
+                target_col, n_unmapped,
+                ", ".join(unknown[:10]),
+                " ..." if len(unknown) > 10 else "",
+            )
+        else:
+            logger.info("  %s: alle %d Zeilen gemappt.", target_col, n_mapped)
+    return df, report
+
+
 # ---------------------------------------------------------------------------
 # Dateiuebergreifender Lookup-Aufbau (Ansatz 3)
 # ---------------------------------------------------------------------------
@@ -611,6 +727,10 @@ def clean_file(path: Path, global_lookups: dict | None = None) -> tuple[pd.DataF
         (global_lookups or {}).get("einlade"),
     )
     cleaning_report["steps"]["einladeregion_auffuellung"] = einlade_fill_report
+
+    # 5c – Makroregion-Spalten aus ISO-Codes ableiten (Fallback fuer Nicht-EU/EEA-Haefen)
+    df, makroregion_report = derive_makroregion_cols(df)
+    cleaning_report["steps"]["makroregion_ableitung"] = makroregion_report
 
     # 6 – Numerische Konvertierung
     df, conv_errors = convert_numeric(df)
