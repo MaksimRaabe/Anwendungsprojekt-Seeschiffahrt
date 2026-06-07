@@ -81,6 +81,31 @@ AUSLADE_REGION_SYNC_COLS = [
     "Ausladeregion_HafenID",
 ]
 
+# Einladeregion-Spalten (spiegelbildlich zu Ausladeregion).
+EINLADE_REGION_SYNC_COLS = [
+    "Einladeregion_NUTS3",
+    "Einladeregion_NUTS3_Label",
+    "Einladeregion_UNLOCODE",
+    "Einladeregion_HafenID",
+]
+
+# ISO-2-Codes der Laender, fuer die NUTS3-Codes existieren (EU-27 + EEA).
+# Fehlende NUTS3-Werte fuer Haefen ausserhalb dieser Menge sind strukturell erwartet.
+NUTS3_COUNTRIES = {
+    "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT",
+    "NL", "PL", "PT", "RO", "SE", "SI", "SK",  # EU-27
+    "NO", "IS", "LI",                           # EEA
+}
+
+# Mapping: NUTS3-Spalte → zugehoerige ISO-Spalte fuer die Erwartet/Unerwartet-Analyse.
+NUTS3_COL_ISO_MAP = {
+    "Ausladeregion_NUTS3":       "Ausladeregion_ISO",
+    "Ausladeregion_NUTS3_Label": "Ausladeregion_ISO",
+    "Einladeregion_NUTS3":       "Einladeregion_ISO",
+    "Einladeregion_NUTS3_Label": "Einladeregion_ISO",
+}
+
 # Erwartete Wertebereich-Pruefungen (Code-Spalten)
 FIELD_CONSTRAINTS = {
     "Referenzzeitraum_Monat": (1, 12),
@@ -249,6 +274,32 @@ def handle_missing_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         container_na = int(df[container_cols_present].isna().sum().sum())
         report["na_container_optional_total"] = container_na
 
+    # Extra: NUTS3-Luecken in erwartet (Nicht-EU/EEA-Hafen) und unerwartet aufteilen
+    nuts3_analysis: dict = {}
+    for nuts3_col, iso_col in NUTS3_COL_ISO_MAP.items():
+        if nuts3_col not in df.columns or iso_col not in df.columns:
+            continue
+        is_nuts3_country = df[iso_col].isin(NUTS3_COUNTRIES)
+        missing_mask = df[nuts3_col].isna()
+        expected = int((missing_mask & ~is_nuts3_country).sum())
+        unexpected = int((missing_mask & is_nuts3_country).sum())
+        nuts3_analysis[nuts3_col] = {
+            "erwartet_fehlend_nicht_eu_eea": expected,
+            "unerwartet_fehlend_eu_eea": unexpected,
+        }
+        if unexpected:
+            logger.warning(
+                "  Unerwartete NUTS3-Luecken in '%s' (EU/EEA-Hafen ohne NUTS3-Code): %d",
+                nuts3_col, unexpected,
+            )
+        else:
+            logger.info(
+                "  '%s': alle %d fehlenden Werte strukturell erwartet (Nicht-EU/EEA-Haefen).",
+                nuts3_col, expected,
+            )
+    if nuts3_analysis:
+        report["nuts3_missing_analyse"] = nuts3_analysis
+
     logger.info("  Fehlende Werte gesamt: %d (Top-%d Spalten im Report)", total_na, top_n)
     return df, report
 
@@ -336,71 +387,80 @@ def _build_value_map(df: pd.DataFrame, source_col: str, target_col: str) -> dict
     return mapping
 
 
-def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Fuellt fehlende Ausladeregion-Werte mit Ausladeregion_HafenID als zentrale Referenz.
+def fill_related_region_values(
+    df: pd.DataFrame,
+    sync_cols: list[str],
+    anchor_col: str,
+    label: str,
+    global_lookup: dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Fuellt fehlende Regions-Werte mit anchor_col als zentrale Referenz.
 
-    Ausladeregion_HafenID ist der Anker; alle anderen Ausladeregion-Spalten werden damit
-    synchronisiert. Auffuellung laeuft iterativ, damit neu gefuellte HafenID-Werte
-    weitere Felder erschliessen koennen.
+    Funktioniert fuer Auslade- und Einladeregion gleichermassen.
+    global_lookup: optionaler dateiuebergreifender Lookup
+      {(source_col, target_col): {source_val: target_val}}
+    Lokale Mappings haben Vorrang vor dem globalen Lookup.
     """
-    present_cols = [c for c in AUSLADE_REGION_SYNC_COLS if c in df.columns]
-    hafen_id_col = "Ausladeregion_HafenID"
-    other_cols = [c for c in present_cols if c != hafen_id_col]
+    present_cols = [c for c in sync_cols if c in df.columns]
+    other_cols = [c for c in present_cols if c != anchor_col]
 
     report = {
-        "zentrale_referenz": hafen_id_col,
+        "zentrale_referenz": anchor_col,
         "gefuellte_werte": {col: 0 for col in present_cols},
         "verbleibende_missing": {col: int(df[col].isna().sum()) for col in present_cols},
     }
 
-    if hafen_id_col not in present_cols:
-        logger.warning("  Ausladeregion_HafenID nicht vorhanden; Auffuellung wird uebersprungen.")
+    if anchor_col not in present_cols:
+        logger.warning("  %s nicht vorhanden; Auffuellung wird uebersprungen.", anchor_col)
         return df, report
 
-    if len(other_cols) == 0:
+    if not other_cols:
         return df, report
 
     df = df.copy()
     df[present_cols] = df[present_cols].replace(r"^\s*$", np.nan, regex=True)
 
+    def _merged_map(src: str, tgt: str) -> dict:
+        """Globalen Lookup mit lokalem Mapping zusammenfuehren (lokal hat Vorrang)."""
+        base = (global_lookup or {}).get((src, tgt), {})
+        local = _build_value_map(df, src, tgt)
+        return {**base, **local}
+
     max_passes = 3
-    for pass_num in range(max_passes):
+    for _ in range(max_passes):
         filled_in_pass = 0
 
-        # Schritt 1: HafenID hat Vorrang – andere Felder werden von HafenID gefuellt
-        hafen_id_non_null = df[hafen_id_col].notna()
-        if hafen_id_non_null.any():
+        # Schritt 1: anchor_col hat Vorrang – andere Felder von anchor_col fuellen
+        anchor_non_null = df[anchor_col].notna()
+        if anchor_non_null.any():
             for target_col in other_cols:
-                value_map = _build_value_map(df, hafen_id_col, target_col)
+                value_map = _merged_map(anchor_col, target_col)
                 if not value_map:
                     continue
 
-                missing_target = df[target_col].isna()
-                fill_mask = hafen_id_non_null & missing_target
+                fill_mask = anchor_non_null & df[target_col].isna()
                 if not fill_mask.any():
                     continue
 
-                fill_values = df.loc[fill_mask, hafen_id_col].map(value_map)
+                fill_values = df.loc[fill_mask, anchor_col].map(value_map)
                 can_fill = fill_values.notna()
                 if not can_fill.any():
                     continue
 
-                fill_index = fill_values[can_fill].index
-                df.loc[fill_index, target_col] = fill_values[can_fill].values
+                df.loc[fill_values[can_fill].index, target_col] = fill_values[can_fill].values
                 filled_count = int(can_fill.sum())
                 report["gefuellte_werte"][target_col] += filled_count
                 filled_in_pass += filled_count
 
-        # Schritt 2: Falls HafenID fehlt, versuche es von anderen Feldern zu fuellen
-        hafen_id_missing = df[hafen_id_col].isna()
-        if hafen_id_missing.any() and len(other_cols) > 0:
+        # Schritt 2: Falls anchor_col fehlt, von anderen Feldern fuellen
+        anchor_missing = df[anchor_col].isna()
+        if anchor_missing.any():
             for source_col in other_cols:
-                source_non_null = df[source_col].notna()
-                fill_mask = source_non_null & hafen_id_missing
+                fill_mask = df[source_col].notna() & anchor_missing
                 if not fill_mask.any():
                     continue
 
-                value_map = _build_value_map(df, source_col, hafen_id_col)
+                value_map = _merged_map(source_col, anchor_col)
                 if not value_map:
                     continue
 
@@ -409,12 +469,11 @@ def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, d
                 if not can_fill.any():
                     continue
 
-                fill_index = fill_values[can_fill].index
-                df.loc[fill_index, hafen_id_col] = fill_values[can_fill].values
+                df.loc[fill_values[can_fill].index, anchor_col] = fill_values[can_fill].values
                 filled_count = int(can_fill.sum())
-                report["gefuellte_werte"][hafen_id_col] += filled_count
+                report["gefuellte_werte"][anchor_col] += filled_count
                 filled_in_pass += filled_count
-                break  # Nutze nur die erste verlaessliche Quelle
+                break  # nur die erste verlaessliche Quelle nutzen
 
         if filled_in_pass == 0:
             break
@@ -426,7 +485,8 @@ def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, d
 
     if report["gesamt_gefuellt"]:
         logger.info(
-            "  Ausladeregion-Werte (HafenID-zentriert) ergaenzt: %d",
+            "  %s-Werte (HafenID-zentriert) ergaenzt: %d",
+            label,
             report["gesamt_gefuellt"],
         )
 
@@ -449,11 +509,70 @@ def validate_iso_codes(df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dateiuebergreifender Lookup-Aufbau (Ansatz 3)
+# ---------------------------------------------------------------------------
+
+def build_global_lookups(csv_files: list[Path]) -> dict[str, dict]:
+    """Liest alle CSV-Dateien einmal vorab und baut spaltenpaarbezogene Lookup-Tabellen.
+
+    Rueckgabe: {
+      "auslade": { (source_col, target_col): {source_val: target_val}, ... },
+      "einlade": { (source_col, target_col): {source_val: target_val}, ... },
+    }
+    Lokale Mappings in fill_related_region_values haben spaeter Vorrang; der globale
+    Lookup erschliesst nur Werte, die in der Einzeldatei nicht beobachtbar sind.
+    """
+    frames = []
+    for path in csv_files:
+        try:
+            df = read_csv(path)
+            df = strip_whitespace(df)
+            df = df.replace(r"^\s*$", np.nan, regex=True)
+            frames.append(df)
+        except Exception as exc:
+            logger.warning("  GlobalLookup: Fehler beim Lesen von '%s': %s", path.name, exc)
+
+    if not frames:
+        logger.warning("  GlobalLookup: Keine Dateien lesbar; Lookup bleibt leer.")
+        return {"auslade": {}, "einlade": {}}
+
+    combined = pd.concat(frames, ignore_index=True)
+    logger.info(
+        "  GlobalLookup: %d Zeilen aus %d Datei(en) kombiniert.",
+        len(combined), len(frames),
+    )
+
+    lookups: dict[str, dict] = {}
+    for key, sync_cols in [
+        ("auslade", AUSLADE_REGION_SYNC_COLS),
+        ("einlade", EINLADE_REGION_SYNC_COLS),
+    ]:
+        present = [c for c in sync_cols if c in combined.columns]
+        pair_maps: dict[tuple[str, str], dict] = {}
+        for src in present:
+            for tgt in present:
+                if src == tgt:
+                    continue
+                m = _build_value_map(combined, src, tgt)
+                if m:
+                    pair_maps[(src, tgt)] = m
+        lookups[key] = pair_maps
+        logger.info(
+            "  GlobalLookup [%s]: %d Spaltenpaare mit Mapping.", key, len(pair_maps)
+        )
+
+    return lookups
+
+
+# ---------------------------------------------------------------------------
 # Haupt-Pipeline
 # ---------------------------------------------------------------------------
 
-def clean_file(path: Path) -> tuple[pd.DataFrame, dict]:
-    """Bereinigt eine einzelne CSV-Datei und gibt den DataFrame + Report zurueck."""
+def clean_file(path: Path, global_lookups: dict | None = None) -> tuple[pd.DataFrame, dict]:
+    """Bereinigt eine einzelne CSV-Datei und gibt den DataFrame + Report zurueck.
+
+    global_lookups: dateiuebergreifende Lookup-Tabellen aus build_global_lookups().
+    """
     logger.info("=" * 70)
     logger.info("Datei: %s", path.name)
 
@@ -473,9 +592,25 @@ def clean_file(path: Path) -> tuple[pd.DataFrame, dict]:
     # 4 – Whitespace bereinigen
     df = strip_whitespace(df)
 
-    # 5 – Fehlende Ausladeregion-Werte anhand der anderen Ausladeregion-Spalten auffuellen
-    df, region_fill_report = fill_related_ausladeregion_values(df)
-    cleaning_report["steps"]["ausladeregion_auffuellung"] = region_fill_report
+    # 5a – Fehlende Ausladeregion-Werte auffuellen
+    df, auslade_fill_report = fill_related_region_values(
+        df,
+        AUSLADE_REGION_SYNC_COLS,
+        "Ausladeregion_HafenID",
+        "Ausladeregion",
+        (global_lookups or {}).get("auslade"),
+    )
+    cleaning_report["steps"]["ausladeregion_auffuellung"] = auslade_fill_report
+
+    # 5b – Fehlende Einladeregion-Werte auffuellen
+    df, einlade_fill_report = fill_related_region_values(
+        df,
+        EINLADE_REGION_SYNC_COLS,
+        "Einladeregion_HafenID",
+        "Einladeregion",
+        (global_lookups or {}).get("einlade"),
+    )
+    cleaning_report["steps"]["einladeregion_auffuellung"] = einlade_fill_report
 
     # 6 – Numerische Konvertierung
     df, conv_errors = convert_numeric(df)
@@ -524,12 +659,16 @@ def run() -> None:
 
     logger.info("Starte Bereinigung von %d Datei(en).", len(csv_files))
 
+    # Einmalig dateiuebergreifende Lookup-Tabellen aus allen Rohdaten aufbauen.
+    logger.info("Baue dateiuebergreifende Lookup-Tabellen (Auslade- und Einladeregion)...")
+    global_lookups = build_global_lookups(csv_files)
+
     all_reports = []
     cleaned_frames = []
 
     for csv_path in csv_files:
         try:
-            df_clean, report = clean_file(csv_path)
+            df_clean, report = clean_file(csv_path, global_lookups=global_lookups)
             cleaned_frames.append(df_clean)
             all_reports.append(report)
         except Exception as exc:
