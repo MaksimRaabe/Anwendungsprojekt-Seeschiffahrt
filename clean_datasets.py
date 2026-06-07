@@ -337,46 +337,50 @@ def _build_value_map(df: pd.DataFrame, source_col: str, target_col: str) -> dict
 
 
 def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Fuellt fehlende Ausladeregion-Werte ueber die anderen Ausladeregion-Spalten.
+    """Fuellt fehlende Ausladeregion-Werte mit Ausladeregion_HafenID als zentrale Referenz.
 
-    Die Funktion nutzt nur vorhandene Werte innerhalb der vier Ausladeregion-Spalten
-    und ueberschreibt keine bereits gesetzten Werte. Die Auffuellung laeuft iterativ,
-    damit ein neu gefuelltes Feld weitere fehlende Felder erschliessen kann.
+    Ausladeregion_HafenID ist der Anker; alle anderen Ausladeregion-Spalten werden damit
+    synchronisiert. Auffuellung laeuft iterativ, damit neu gefuellte HafenID-Werte
+    weitere Felder erschliessen koennen.
     """
     present_cols = [c for c in AUSLADE_REGION_SYNC_COLS if c in df.columns]
+    hafen_id_col = "Ausladeregion_HafenID"
+    other_cols = [c for c in present_cols if c != hafen_id_col]
+
     report = {
+        "zentrale_referenz": hafen_id_col,
         "gefuellte_werte": {col: 0 for col in present_cols},
         "verbleibende_missing": {col: int(df[col].isna().sum()) for col in present_cols},
     }
 
-    if len(present_cols) < 2:
+    if hafen_id_col not in present_cols:
+        logger.warning("  Ausladeregion_HafenID nicht vorhanden; Auffuellung wird uebersprungen.")
+        return df, report
+
+    if len(other_cols) == 0:
         return df, report
 
     df = df.copy()
     df[present_cols] = df[present_cols].replace(r"^\s*$", np.nan, regex=True)
 
     max_passes = 3
-    for _ in range(max_passes):
+    for pass_num in range(max_passes):
         filled_in_pass = 0
-        for source_col in present_cols:
-            source_non_null = df[source_col].notna()
-            if not source_non_null.any():
-                continue
 
-            for target_col in present_cols:
-                if source_col == target_col:
-                    continue
-
-                value_map = _build_value_map(df, source_col, target_col)
+        # Schritt 1: HafenID hat Vorrang – andere Felder werden von HafenID gefuellt
+        hafen_id_non_null = df[hafen_id_col].notna()
+        if hafen_id_non_null.any():
+            for target_col in other_cols:
+                value_map = _build_value_map(df, hafen_id_col, target_col)
                 if not value_map:
                     continue
 
                 missing_target = df[target_col].isna()
-                fill_mask = source_non_null & missing_target
+                fill_mask = hafen_id_non_null & missing_target
                 if not fill_mask.any():
                     continue
 
-                fill_values = df.loc[fill_mask, source_col].map(value_map)
+                fill_values = df.loc[fill_mask, hafen_id_col].map(value_map)
                 can_fill = fill_values.notna()
                 if not can_fill.any():
                     continue
@@ -386,6 +390,31 @@ def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, d
                 filled_count = int(can_fill.sum())
                 report["gefuellte_werte"][target_col] += filled_count
                 filled_in_pass += filled_count
+
+        # Schritt 2: Falls HafenID fehlt, versuche es von anderen Feldern zu fuellen
+        hafen_id_missing = df[hafen_id_col].isna()
+        if hafen_id_missing.any() and len(other_cols) > 0:
+            for source_col in other_cols:
+                source_non_null = df[source_col].notna()
+                fill_mask = source_non_null & hafen_id_missing
+                if not fill_mask.any():
+                    continue
+
+                value_map = _build_value_map(df, source_col, hafen_id_col)
+                if not value_map:
+                    continue
+
+                fill_values = df.loc[fill_mask, source_col].map(value_map)
+                can_fill = fill_values.notna()
+                if not can_fill.any():
+                    continue
+
+                fill_index = fill_values[can_fill].index
+                df.loc[fill_index, hafen_id_col] = fill_values[can_fill].values
+                filled_count = int(can_fill.sum())
+                report["gefuellte_werte"][hafen_id_col] += filled_count
+                filled_in_pass += filled_count
+                break  # Nutze nur die erste verlaessliche Quelle
 
         if filled_in_pass == 0:
             break
@@ -397,7 +426,7 @@ def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, d
 
     if report["gesamt_gefuellt"]:
         logger.info(
-            "  Ausladeregion-Werte aus anderen Ausladeregion-Spalten ergaenzt: %d",
+            "  Ausladeregion-Werte (HafenID-zentriert) ergaenzt: %d",
             report["gesamt_gefuellt"],
         )
 
