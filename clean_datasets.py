@@ -72,6 +72,15 @@ CONTAINER_OPTIONAL = [
     "TEU",
 ]
 
+# Ausladeregion-Spalten, die untereinander auf Konsistenz geprueft und
+# gegenseitig zur Auffuellung fehlender Werte verwendet werden.
+AUSLADE_REGION_SYNC_COLS = [
+    "Ausladeregion_NUTS3",
+    "Ausladeregion_NUTS3_Label",
+    "Ausladeregion_UNLOCODE",
+    "Ausladeregion_HafenID",
+]
+
 # Erwartete Wertebereich-Pruefungen (Code-Spalten)
 FIELD_CONSTRAINTS = {
     "Referenzzeitraum_Monat": (1, 12),
@@ -310,6 +319,91 @@ def strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _build_value_map(df: pd.DataFrame, source_col: str, target_col: str) -> dict:
+    """Erzeugt eine robuste 1:1-Abbildung aus vorhandenen Quellenwerten."""
+    subset = df[[source_col, target_col]].dropna()
+    if subset.empty:
+        return {}
+
+    mapping = {}
+    grouped = subset.groupby(source_col, dropna=True)[target_col]
+    for source_value, values in grouped:
+        non_null_values = values.dropna()
+        if non_null_values.empty:
+            continue
+        mode = non_null_values.mode(dropna=True)
+        mapping[source_value] = mode.iloc[0] if not mode.empty else non_null_values.iloc[0]
+    return mapping
+
+
+def fill_related_ausladeregion_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Fuellt fehlende Ausladeregion-Werte ueber die anderen Ausladeregion-Spalten.
+
+    Die Funktion nutzt nur vorhandene Werte innerhalb der vier Ausladeregion-Spalten
+    und ueberschreibt keine bereits gesetzten Werte. Die Auffuellung laeuft iterativ,
+    damit ein neu gefuelltes Feld weitere fehlende Felder erschliessen kann.
+    """
+    present_cols = [c for c in AUSLADE_REGION_SYNC_COLS if c in df.columns]
+    report = {
+        "gefuellte_werte": {col: 0 for col in present_cols},
+        "verbleibende_missing": {col: int(df[col].isna().sum()) for col in present_cols},
+    }
+
+    if len(present_cols) < 2:
+        return df, report
+
+    df = df.copy()
+    df[present_cols] = df[present_cols].replace(r"^\s*$", np.nan, regex=True)
+
+    max_passes = 3
+    for _ in range(max_passes):
+        filled_in_pass = 0
+        for source_col in present_cols:
+            source_non_null = df[source_col].notna()
+            if not source_non_null.any():
+                continue
+
+            for target_col in present_cols:
+                if source_col == target_col:
+                    continue
+
+                value_map = _build_value_map(df, source_col, target_col)
+                if not value_map:
+                    continue
+
+                missing_target = df[target_col].isna()
+                fill_mask = source_non_null & missing_target
+                if not fill_mask.any():
+                    continue
+
+                fill_values = df.loc[fill_mask, source_col].map(value_map)
+                can_fill = fill_values.notna()
+                if not can_fill.any():
+                    continue
+
+                fill_index = fill_values[can_fill].index
+                df.loc[fill_index, target_col] = fill_values[can_fill].values
+                filled_count = int(can_fill.sum())
+                report["gefuellte_werte"][target_col] += filled_count
+                filled_in_pass += filled_count
+
+        if filled_in_pass == 0:
+            break
+
+    report["verbleibende_missing"] = {
+        col: int(df[col].isna().sum()) for col in present_cols
+    }
+    report["gesamt_gefuellt"] = int(sum(report["gefuellte_werte"].values()))
+
+    if report["gesamt_gefuellt"]:
+        logger.info(
+            "  Ausladeregion-Werte aus anderen Ausladeregion-Spalten ergaenzt: %d",
+            report["gesamt_gefuellt"],
+        )
+
+    return df, report
+
+
 def validate_iso_codes(df: pd.DataFrame) -> dict:
     """Prueft, ob ISO-Codes aus genau 2 Buchstaben bestehen."""
     report = {}
@@ -350,27 +444,31 @@ def clean_file(path: Path) -> tuple[pd.DataFrame, dict]:
     # 4 – Whitespace bereinigen
     df = strip_whitespace(df)
 
-    # 5 – Numerische Konvertierung
+    # 5 – Fehlende Ausladeregion-Werte anhand der anderen Ausladeregion-Spalten auffuellen
+    df, region_fill_report = fill_related_ausladeregion_values(df)
+    cleaning_report["steps"]["ausladeregion_auffuellung"] = region_fill_report
+
+    # 6 – Numerische Konvertierung
     df, conv_errors = convert_numeric(df)
     cleaning_report["steps"]["konvertierungsfehler"] = conv_errors
 
-    # 6 – Fehlende Werte kontrollieren
+    # 7 – Fehlende Werte kontrollieren
     df, missing_report = handle_missing_values(df)
     cleaning_report["steps"]["fehlende_werte"] = missing_report
 
-    # 7 – Bereichsvalidierung
+    # 8 – Bereichsvalidierung
     range_violations = validate_ranges(df)
     cleaning_report["steps"]["bereichsverletzungen"] = range_violations
 
-    # 8 – ISO-Code-Validierung
+    # 9 – ISO-Code-Validierung
     iso_violations = validate_iso_codes(df)
     cleaning_report["steps"]["iso_fehler"] = iso_violations
 
-    # 9 – Duplikate entfernen
+    # 10 – Duplikate entfernen
     df, n_dupes = remove_duplicates(df)
     cleaning_report["steps"]["duplikate_entfernt"] = n_dupes
 
-    # 10 – Ausreisser markieren
+    # 11 – Ausreisser markieren
     outlier_report = detect_outliers_iqr(df)
     cleaning_report["steps"]["ausreisser"] = outlier_report
 
