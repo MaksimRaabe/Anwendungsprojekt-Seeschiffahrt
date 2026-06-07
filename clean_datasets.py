@@ -21,6 +21,9 @@ import logging
 import json
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from logging.handlers import QueueHandler, QueueListener
+from multiprocessing import Queue as MPQueue
 
 import numpy as np
 import pandas as pd
@@ -37,18 +40,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging  (Setup erfolgt in run(); Worker-Prozesse nutzen QueueHandler)
 # ---------------------------------------------------------------------------
-log_file = LOG_DIR / f"cleaning_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
 logger = logging.getLogger(__name__)
+
+_LOG_FMT = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s")
 
 # ---------------------------------------------------------------------------
 # Felddefinitionen gemaess Datensatzbeschreibung
@@ -628,8 +624,19 @@ def derive_makroregion_cols(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 # Dateiuebergreifender Lookup-Aufbau (Ansatz 3)
 # ---------------------------------------------------------------------------
 
+def _read_one_for_lookup(path: Path) -> pd.DataFrame | None:
+    """Liest eine einzelne CSV-Datei fuer den globalen Lookup (Thread-sicher)."""
+    try:
+        df = read_csv(path)
+        df = strip_whitespace(df)
+        return df.replace(r"^\s*$", np.nan, regex=True)
+    except Exception as exc:
+        logger.warning("  GlobalLookup: Fehler beim Lesen von '%s': %s", path.name, exc)
+        return None
+
+
 def build_global_lookups(csv_files: list[Path]) -> dict[str, dict]:
-    """Liest alle CSV-Dateien einmal vorab und baut spaltenpaarbezogene Lookup-Tabellen.
+    """Liest alle CSV-Dateien parallel (Threads) und baut spaltenpaarbezogene Lookup-Tabellen.
 
     Rueckgabe: {
       "auslade": { (source_col, target_col): {source_val: target_val}, ... },
@@ -639,14 +646,13 @@ def build_global_lookups(csv_files: list[Path]) -> dict[str, dict]:
     Lookup erschliesst nur Werte, die in der Einzeldatei nicht beobachtbar sind.
     """
     frames = []
-    for path in csv_files:
-        try:
-            df = read_csv(path)
-            df = strip_whitespace(df)
-            df = df.replace(r"^\s*$", np.nan, regex=True)
-            frames.append(df)
-        except Exception as exc:
-            logger.warning("  GlobalLookup: Fehler beim Lesen von '%s': %s", path.name, exc)
+    n_workers = min(4, len(csv_files))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_read_one_for_lookup, p): p for p in csv_files}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                frames.append(result)
 
     if not frames:
         logger.warning("  GlobalLookup: Keine Dateien lesbar; Lookup bleibt leer.")
@@ -683,6 +689,23 @@ def build_global_lookups(csv_files: list[Path]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Haupt-Pipeline
 # ---------------------------------------------------------------------------
+
+_MAX_WORKERS = 3  # 3 parallele Prozesse x ~300 MB/Datei ≈ 900 MB RAM-Spitze
+
+
+def _worker_init(queue: MPQueue) -> None:
+    """Richtet Logging in Worker-Prozessen auf die zentrale Queue um."""
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(QueueHandler(queue))
+    root.setLevel(logging.INFO)
+
+
+def _clean_file_worker(args: tuple) -> tuple[pd.DataFrame, dict]:
+    """Top-level Wrapper fuer ProcessPoolExecutor (muss picklable sein)."""
+    path, global_lookups = args
+    return clean_file(path, global_lookups=global_lookups)
+
 
 def clean_file(path: Path, global_lookups: dict | None = None) -> tuple[pd.DataFrame, dict]:
     """Bereinigt eine einzelne CSV-Datei und gibt den DataFrame + Report zurueck.
@@ -766,72 +789,101 @@ def clean_file(path: Path, global_lookups: dict | None = None) -> tuple[pd.DataF
 
 
 def run() -> None:
-    if not DATASETS_DIR.exists():
-        logger.error(
-            "Ordner '%s' nicht gefunden. Bitte CSV-Dateien dort ablegen.", DATASETS_DIR
-        )
-        return
+    # Logging-Setup (nur im Haupt-Prozess; Worker nutzen QueueHandler)
+    log_file = LOG_DIR / f"cleaning_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    _fh = logging.FileHandler(log_file, encoding="utf-8")
+    _fh.setFormatter(_LOG_FMT)
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_LOG_FMT)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(_fh)
+    root.addHandler(_sh)
 
-    csv_files = sorted(DATASETS_DIR.glob("*.csv"))
-    if not csv_files:
-        logger.warning("Keine CSV-Dateien in '%s' gefunden.", DATASETS_DIR)
-        return
+    log_queue: MPQueue = MPQueue()
+    listener = QueueListener(log_queue, _fh, _sh, respect_handler_level=True)
+    listener.start()
 
-    logger.info("Starte Bereinigung von %d Datei(en).", len(csv_files))
+    try:
+        if not DATASETS_DIR.exists():
+            logger.error(
+                "Ordner '%s' nicht gefunden. Bitte CSV-Dateien dort ablegen.", DATASETS_DIR
+            )
+            return
 
-    # Einmalig dateiuebergreifende Lookup-Tabellen aus allen Rohdaten aufbauen.
-    logger.info("Baue dateiuebergreifende Lookup-Tabellen (Auslade- und Einladeregion)...")
-    global_lookups = build_global_lookups(csv_files)
+        csv_files = sorted(DATASETS_DIR.glob("*.csv"))
+        if not csv_files:
+            logger.warning("Keine CSV-Dateien in '%s' gefunden.", DATASETS_DIR)
+            return
 
-    all_reports = []
-    cleaned_frames = []
+        logger.info("Starte Bereinigung von %d Datei(en).", len(csv_files))
 
-    for csv_path in csv_files:
-        try:
-            df_clean, report = clean_file(csv_path, global_lookups=global_lookups)
-            cleaned_frames.append(df_clean)
-            all_reports.append(report)
-        except Exception as exc:
-            logger.error("Fehler bei '%s': %s", csv_path.name, exc, exc_info=True)
+        # Einmalig dateiuebergreifende Lookup-Tabellen aus allen Rohdaten aufbauen.
+        logger.info("Baue dateiuebergreifende Lookup-Tabellen (Auslade- und Einladeregion)...")
+        global_lookups = build_global_lookups(csv_files)
 
-    # Kombinierten Datensatz erstellen und speichern
-    if cleaned_frames:
-        combined = pd.concat(cleaned_frames, ignore_index=True)
+        all_reports = []
+        cleaned_frames = []
 
-        # Globale Duplikate (ueber alle Dateien) nochmals entfernen
-        before = len(combined)
-        combined = combined.drop_duplicates(
-            subset=[c for c in combined.columns if c != "Quelldatei"]
-        )
-        n_global_dupes = before - len(combined)
-        if n_global_dupes:
-            logger.warning("  Dateiuebergreifende Duplikate entfernt: %d", n_global_dupes)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = OUTPUT_DIR / f"seeverkehr_bereinigt_{timestamp}.csv"
-        combined.to_csv(out_path, sep=";", encoding="utf-8-sig", decimal=",", index=False)
-
-        logger.info("=" * 70)
-        logger.info("Kombinierter Datensatz: %d Zeilen, %d Spalten", *combined.shape)
-        logger.info("Gespeichert: %s", out_path)
-
-        # Gesamtstatistik in Report aufnehmen
-        all_reports.append({
-            "combined": {
-                "dateien": len(cleaned_frames),
-                "zeilen_gesamt": int(combined.shape[0]),
-                "spalten": int(combined.shape[1]),
-                "dateiuebergreifende_duplikate_entfernt": n_global_dupes,
-                "ausgabedatei": out_path.name,
+        with ProcessPoolExecutor(
+            max_workers=_MAX_WORKERS,
+            initializer=_worker_init,
+            initargs=(log_queue,),
+        ) as pool:
+            futures = {
+                pool.submit(_clean_file_worker, (p, global_lookups)): p
+                for p in csv_files
             }
-        })
+            for fut in as_completed(futures):
+                csv_path = futures[fut]
+                try:
+                    df_clean, report = fut.result()
+                    cleaned_frames.append(df_clean)
+                    all_reports.append(report)
+                except Exception as exc:
+                    logger.error("Fehler bei '%s': %s", csv_path.name, exc, exc_info=True)
 
-    # Report als JSON speichern
-    report_path = LOG_DIR / f"cleaning_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(all_reports, f, ensure_ascii=False, indent=2)
+        # Kombinierten Datensatz erstellen und speichern
+        if cleaned_frames:
+            combined = pd.concat(cleaned_frames, ignore_index=True)
 
-    logger.info("Report: %s", report_path)
+            # Globale Duplikate (ueber alle Dateien) nochmals entfernen
+            before = len(combined)
+            combined = combined.drop_duplicates(
+                subset=[c for c in combined.columns if c != "Quelldatei"]
+            )
+            n_global_dupes = before - len(combined)
+            if n_global_dupes:
+                logger.warning("  Dateiuebergreifende Duplikate entfernt: %d", n_global_dupes)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = OUTPUT_DIR / f"seeverkehr_bereinigt_{timestamp}.csv"
+            combined.to_csv(out_path, sep=";", encoding="utf-8-sig", decimal=",", index=False)
+
+            logger.info("=" * 70)
+            logger.info("Kombinierter Datensatz: %d Zeilen, %d Spalten", *combined.shape)
+            logger.info("Gespeichert: %s", out_path)
+
+            # Gesamtstatistik in Report aufnehmen
+            all_reports.append({
+                "combined": {
+                    "dateien": len(cleaned_frames),
+                    "zeilen_gesamt": int(combined.shape[0]),
+                    "spalten": int(combined.shape[1]),
+                    "dateiuebergreifende_duplikate_entfernt": n_global_dupes,
+                    "ausgabedatei": out_path.name,
+                }
+            })
+
+        # Report als JSON speichern
+        report_path = LOG_DIR / f"cleaning_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(all_reports, f, ensure_ascii=False, indent=2)
+
+        logger.info("Report: %s", report_path)
+
+    finally:
+        listener.stop()
 
 
 if __name__ == "__main__":
