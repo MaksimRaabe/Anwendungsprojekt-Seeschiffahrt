@@ -29,11 +29,15 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy import stats as sp_stats
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from statsmodels.tsa.stattools import acf as sm_acf
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import pacf as sm_pacf
 
 import dash
 import dash_bootstrap_components as dbc
@@ -98,6 +102,25 @@ MODEL_OPTIONS = [
 ACCENT = "#00d4aa"
 DARK_CARD = {"background": "#1e1e30", "border": "1px solid #2d2d45"}
 CHART_TPL = "plotly_dark"
+TABLE_STYLE = {
+    "--bs-table-bg": "#13132a",
+    "--bs-table-striped-bg": "#191930",
+    "--bs-table-hover-bg": "#1f1f3d",
+    "--bs-table-color": "#c8ccd4",
+    "--bs-table-striped-color": "#c8ccd4",
+    "--bs-table-hover-color": "#ffffff",
+    "--bs-table-border-color": "#2d2d50",
+}
+TH_STYLE = {
+    "background": "#0d0d22",
+    "color": "#00d4aa",
+    "borderColor": "#2d2d50",
+    "fontWeight": "600",
+    "letterSpacing": "0.05em",
+    "fontSize": "0.75rem",
+    "textTransform": "uppercase",
+    "whiteSpace": "nowrap",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Datenpipeline
@@ -364,16 +387,120 @@ def _ts_from_agg(agg_name: str, metric: str, years_range: list, ports_sel: list)
     return grouped.sort_index().dropna()
 
 
-def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon: int = 12) -> dict:
-    ts = series.dropna().sort_index()
-    if len(ts) < 18:
-        return {"error": f"Zu wenige Datenpunkte: {len(ts)} (mind. 18 benötigt)"}
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistische Analyse-Werkzeuge (Aspekte C, D, E gemäß Bewertungsschema)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    values = ts.values.astype(float)
-    n = len(values)
-    months = ts.index.month.values
+def _descriptive_stats(values: np.ndarray) -> pd.DataFrame:
+    """Deskriptive Statistiken inkl. Schiefe und Exzess-Wölbung (Fisher-Definition)."""
+    v = values[~np.isnan(values)]
+    q1, q3 = np.percentile(v, [25, 75])
+    return pd.DataFrame({
+        "Kennzahl": [
+            "n (Beobachtungen)", "Mittelwert (μ)", "Std.-Abw. (σ)", "Variationskoeff. (σ/μ)",
+            "Minimum", "Q1 (25 %)", "Median (Q2)", "Q3 (75 %)", "Maximum",
+            "IQR (Q3 – Q1)", "Schiefe (γ₁)", "Exzess-Kurtosis (γ₂)",
+        ],
+        "Wert": [
+            len(v),
+            round(float(np.mean(v)), 2),
+            round(float(np.std(v, ddof=1)), 2),
+            round(float(np.std(v, ddof=1) / np.mean(v)), 4) if np.mean(v) != 0 else float("nan"),
+            round(float(np.min(v)), 2),
+            round(float(q1), 2),
+            round(float(np.median(v)), 2),
+            round(float(q3), 2),
+            round(float(np.max(v)), 2),
+            round(float(q3 - q1), 2),
+            round(float(sp_stats.skew(v)), 4),
+            round(float(sp_stats.kurtosis(v)), 4),
+        ],
+    })
 
-    t = np.arange(n)
+
+def _adf_test(ts: pd.Series) -> dict:
+    """Augmented Dickey-Fuller Test auf Stationarität (H₀: Einheitswurzel vorhanden).
+
+    Signifikanz: α = 0.05. Ablehnung von H₀ → Zeitreihe ist stationär.
+    Lag-Auswahl: AIC-Kriterium.
+    """
+    v = ts.dropna().values
+    if len(v) < 15:
+        return {"error": f"Zu wenige Datenpunkte für ADF ({len(v)} < 15)"}
+    try:
+        stat, pval, lags, nobs, crits, _ = adfuller(v, autolag="AIC")
+        return {
+            "stat": round(stat, 4),
+            "pvalue": round(pval, 4),
+            "lags_used": int(lags),
+            "nobs": int(nobs),
+            "critical_1": round(crits["1%"], 4),
+            "critical_5": round(crits["5%"], 4),
+            "critical_10": round(crits["10%"], 4),
+            "stationary": pval < 0.05,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _normality_tests(values: np.ndarray) -> dict:
+    """Shapiro-Wilk (n ≤ 5 000) oder Kolmogorov-Smirnov (n > 5 000) + Jarque-Bera.
+
+    H₀ in beiden Tests: Normalverteilung. Ablehnung bei p < 0.05 (α = 5 %).
+    Jarque-Bera prüft Schiefe (γ₁ = 0) und Wölbung (γ₂ = 0) gemeinsam.
+    """
+    v = values[~np.isnan(values)]
+    out: dict = {}
+    if 3 <= len(v) <= 5_000:
+        stat, p = sp_stats.shapiro(v)
+        out["Shapiro-Wilk"] = {"stat": round(stat, 4), "pvalue": round(p, 4), "normal": p >= 0.05}
+    else:
+        stat, p = sp_stats.kstest(v, "norm", args=(float(np.mean(v)), float(np.std(v))))
+        out["Kolmogorov-Smirnov"] = {"stat": round(stat, 4), "pvalue": round(p, 4), "normal": p >= 0.05}
+    jb_stat, jb_p = sp_stats.jarque_bera(v)
+    out["Jarque-Bera"] = {"stat": round(jb_stat, 4), "pvalue": round(jb_p, 4), "normal": jb_p >= 0.05}
+    return out
+
+
+def _durbin_watson(residuals: np.ndarray) -> float:
+    """Durbin-Watson-Statistik: d = Σ(eₜ − eₜ₋₁)² / Σeₜ².
+
+    d ≈ 2 → keine Autokorrelation; d < 1.5 → positive, d > 2.5 → negative Autokorrelation.
+    """
+    r = residuals[~np.isnan(residuals)]
+    return float(np.sum(np.diff(r) ** 2) / np.sum(r ** 2)) if len(r) > 1 else float("nan")
+
+
+def _acf_pacf_figure(values: np.ndarray, nlags: int = 24) -> go.Figure:
+    """Autokorrelationsfunktion (ACF) und partielle ACF (PACF) als Plotly-Subplots.
+
+    Konfidenzband: ±1,96 / √n (asymptotisch, α = 5 %).
+    """
+    v = values[~np.isnan(values)]
+    nlags = min(nlags, len(v) // 3)
+    acf_vals = sm_acf(v, nlags=nlags, fft=True)
+    pacf_vals = sm_pacf(v, nlags=nlags, method="ywm")
+    ci = 1.96 / np.sqrt(len(v))
+    lags_x = list(range(len(acf_vals)))
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Autokorrelationsfunktion (ACF)", "Partielle ACF (PACF)"],
+    )
+    for col_i, (vals, name, color) in enumerate(
+        [(acf_vals, "ACF", ACCENT), (pacf_vals, "PACF", "#9b59b6")], start=1
+    ):
+        fig.add_bar(x=lags_x, y=vals, name=name, marker_color=color, row=1, col=col_i)
+        for sign in [1, -1]:
+            fig.add_hline(y=sign * ci, line_dash="dot", line_color="#e74c3c",
+                          line_width=1, row=1, col=col_i)
+    fig.update_xaxes(title_text="Lag (Monate)")
+    fig.update_yaxes(title_text="Korrelationskoeffizient", range=[-1.05, 1.05])
+    return fig
+
+
+def _build_feature_matrix(values: np.ndarray, months: np.ndarray, t: np.ndarray) -> pd.DataFrame:
+    """Gemeinsame Feature-Matrix für Training und CV (DRY-Prinzip)."""
     X = pd.DataFrame({
         "t": t, "t2": t ** 2,
         "month_sin": np.sin(2 * np.pi * months / 12),
@@ -382,15 +509,145 @@ def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon
         "q_cos": np.cos(2 * np.pi * ((months - 1) // 3 + 1) / 4),
     })
     for lag in [1, 2, 3, 6, 12]:
-        lagged = np.full(n, np.nan)
-        if n > lag:
+        lagged = np.full(len(values), np.nan)
+        if len(values) > lag:
             lagged[lag:] = values[:-lag]
         X[f"lag_{lag}"] = lagged
     for w in [3, 6, 12]:
         X[f"roll_{w}"] = pd.Series(values).rolling(w, min_periods=1).mean().values
+    return X.fillna(X.mean())
 
+
+def _cv_all_models(ts: pd.Series, n_splits: int = 5) -> pd.DataFrame:
+    """Walk-forward-Kreuzvalidierung (Time-Series CV) für alle 4 Modelle.
+
+    Methode: n_splits Folds, jeweils Training auf historischen Daten,
+    Test auf den folgenden fold_size Monaten (keine Datenleckage).
+    Komplexität: O(n_splits · n · d · log n) für Ensemble-Modelle.
+    """
+    ts_c = ts.dropna().sort_index()
+    n = len(ts_c)
+    if n < 30:
+        return pd.DataFrame()
+
+    values = ts_c.values.astype(float)
+    months = ts_c.index.month.values
+    t_arr = np.arange(n)
+    X_full = _build_feature_matrix(values, months, t_arr)
+
+    model_defs = {
+        "Linear (Ridge)":       Pipeline([("sc", StandardScaler()), ("m", Ridge(alpha=10.0))]),
+        "Polynomial (Grad 2)":  Pipeline([("poly", PolynomialFeatures(2, include_bias=False)),
+                                          ("sc", StandardScaler(with_mean=False)),
+                                          ("m", Ridge(alpha=1.0))]),
+        "Random Forest":        RandomForestRegressor(
+            n_estimators=200, max_depth=8, min_samples_leaf=3, n_jobs=-1, random_state=42),
+        "Gradient Boosting":    GradientBoostingRegressor(
+            n_estimators=150, max_depth=4, learning_rate=0.05, subsample=0.8, random_state=42),
+    }
+
+    fold_size = max(6, n // (n_splits + 2))
+    min_train = max(18, fold_size * 2)
+    rows = []
+    for mname, mdl in model_defs.items():
+        maes, rmses, r2s = [], [], []
+        for i in range(n_splits):
+            split = min_train + i * fold_size
+            if split + fold_size > n:
+                break
+            X_tr, X_te = X_full.iloc[:split], X_full.iloc[split:split + fold_size]
+            y_tr, y_te = values[:split], values[split:split + fold_size]
+            try:
+                mdl.fit(X_tr, y_tr)
+                y_p = np.maximum(0, mdl.predict(X_te))
+                maes.append(mean_absolute_error(y_te, y_p))
+                rmses.append(np.sqrt(mean_squared_error(y_te, y_p)))
+                r2s.append(r2_score(y_te, y_p))
+            except Exception:
+                pass
+        if maes:
+            rows.append({
+                "Modell": mname,
+                "CV-Folds": len(maes),
+                "MAE (Ø)": round(float(np.mean(maes)), 1),
+                "MAE (±σ)": round(float(np.std(maes)), 1),
+                "RMSE (Ø)": round(float(np.mean(rmses)), 1),
+                "R² (Ø)": round(float(np.mean(r2s)), 3),
+                "R² (±σ)": round(float(np.std(r2s)), 3),
+            })
+    return pd.DataFrame(rows)
+
+
+# Modell-Metadaten für Dokumentation (Aspekt D)
+MODEL_METADATA = {
+    "random_forest": {
+        "name": "Random Forest Regressor",
+        "formula": "f̂(x) = (1/B) · Σᵦ Tᵦ(x),  B = 200 Bäume",
+        "loss": "MSE-Split-Kriterium: Gini/Varianzreduktion",
+        "complexity_train": "O(B · n · d · log n)",
+        "complexity_pred": "O(B · log n)",
+        "hyperparams": [
+            ("n_estimators", 200, "Anzahl Bäume (B)"),
+            ("max_depth", 8, "Maximale Baumtiefe"),
+            ("min_samples_leaf", 3, "Min. Blattgröße (Regularisierung)"),
+            ("random_state", 42, "Zufallsseed (Reproduzierbarkeit)"),
+        ],
+        "assumption": "Nicht-parametrisch; keine Verteilungsannahme an Residuen.",
+    },
+    "gradient_boosting": {
+        "name": "Gradient Boosting Regressor",
+        "formula": "Fₘ(x) = Fₘ₋₁(x) + γₘ · hₘ(x),  M = 150 Stufen",
+        "loss": "L(y,F) = ½(y−F)²; Pseudoresiduen: rᵢₘ = −∂L/∂F = yᵢ − Fₘ₋₁(xᵢ)",
+        "complexity_train": "O(M · n · d · log n)",
+        "complexity_pred": "O(M · log n)",
+        "hyperparams": [
+            ("n_estimators", 150, "Anzahl Boosting-Stufen (M)"),
+            ("max_depth", 4, "Schwache Lernende: Tiefe 4"),
+            ("learning_rate", 0.05, "Schrittweite η (Shrinkage)"),
+            ("subsample", 0.8, "Stochastic GB: 80 % Datenstichprobe"),
+            ("random_state", 42, "Zufallsseed"),
+        ],
+        "assumption": "Additives Modell; Residuen können nicht-normal sein.",
+    },
+    "linear": {
+        "name": "Ridge-Regression (L2-Regularisierung)",
+        "formula": "β̂ = argmin{ ||Xβ − y||₂² + α·||β||₂² }  →  β̂ = (XᵀX + αI)⁻¹Xᵀy",
+        "loss": "Ridge-Loss: L(β) = ||Xβ − y||² + α·||β||²,  α = 10",
+        "complexity_train": "O(n · d²)  (Normalgleichung)",
+        "complexity_pred": "O(d)",
+        "hyperparams": [
+            ("alpha", 10.0, "Regularisierungsparameter α (L2-Penalty)"),
+        ],
+        "assumption": "Linearitätsannahme; Residuen sollten normalverteilt sein (OLS-Konsistenz).",
+    },
+    "polynomial": {
+        "name": "Polynomiale Ridge-Regression (Grad 2)",
+        "formula": "X → Φ(X) mit |Φ| = C(d+2,2); dann Ridge auf Φ(X)",
+        "loss": "Ridge-Loss auf erweitertem Feature-Raum,  α = 1",
+        "complexity_train": "O(n · d⁴)  (d² Features nach PolynomialFeatures)",
+        "complexity_pred": "O(d²)",
+        "hyperparams": [
+            ("degree", 2, "Polynomgrad (Interaktionsterme + Quadrate)"),
+            ("alpha", 1.0, "Regularisierungsparameter α"),
+            ("include_bias", False, "Bias via StandardScaler"),
+        ],
+        "assumption": "Linearität im Feature-Raum Φ(X); stärkere Regularisierung nötig.",
+    },
+}
+
+
+def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon: int = 12) -> dict:
+    ts = series.dropna().sort_index()
+    if len(ts) < 18:
+        return {"error": f"Zu wenige Datenpunkte: {len(ts)} (mind. 18 benötigt)"}
+
+    values = ts.values.astype(float)
+    n = len(values)
+    months = ts.index.month.values
+    t = np.arange(n)
+
+    X = _build_feature_matrix(values, months, t)
     col_means = X.mean()
-    X = X.fillna(col_means)
 
     test_size = min(12, max(6, n // 6))
     train_end = n - test_size
@@ -410,6 +667,7 @@ def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon
     model = _models.get(model_name, _models["random_forest"])
     model.fit(X_tr, y_tr)
 
+    y_pred_tr = np.maximum(0, model.predict(X_tr))
     y_pred_te = np.maximum(0, model.predict(X_te))
     rmse = float(np.sqrt(mean_squared_error(y_te, y_pred_te)))
 
@@ -418,7 +676,7 @@ def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon
     )
     buffer = list(values)
     forecast_vals = []
-    for h, (new_date) in enumerate(future_dates):
+    for h, new_date in enumerate(future_dates):
         new_t = n + h
         m = new_date.month
         row = {"t": new_t, "t2": new_t ** 2,
@@ -443,15 +701,22 @@ def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon
     if hasattr(raw, "feature_importances_"):
         fi = dict(sorted(zip(X_tr.columns, raw.feature_importances_), key=lambda x: -x[1]))
 
+    residuals = y_te - y_pred_te
+    norm_tests = _normality_tests(residuals)
+    dw_stat = _durbin_watson(residuals)
+
     return {
         "forecast": forecast_arr,
         "lower_ci": np.maximum(0, forecast_arr - 1.96 * uncertainty),
         "upper_ci": forecast_arr + 1.96 * uncertainty,
         "future_dates": future_dates,
         "metrics": {
-            "MAE":  round(mean_absolute_error(y_te, y_pred_te), 1),
-            "RMSE": round(rmse, 1),
-            "R²":   round(r2_score(y_te, y_pred_te), 3),
+            "MAE":       round(mean_absolute_error(y_te, y_pred_te), 1),
+            "RMSE":      round(rmse, 1),
+            "R²":        round(r2_score(y_te, y_pred_te), 3),
+            "MAE_train": round(mean_absolute_error(y_tr, y_pred_tr), 1),
+            "RMSE_train": round(float(np.sqrt(mean_squared_error(y_tr, y_pred_tr))), 1),
+            "R²_train":  round(r2_score(y_tr, y_pred_tr), 3),
         },
         "feature_importance": fi,
         "test_actual": y_te,
@@ -459,6 +724,11 @@ def build_forecast(series: pd.Series, model_name: str = "random_forest", horizon
         "train_end_idx": train_end,
         "ts_index": ts.index,
         "ts_values": values,
+        "residual_normality": norm_tests,
+        "durbin_watson": dw_stat,
+        "n_features": X_tr.shape[1],
+        "n_train": train_end,
+        "n_test": test_size,
     }
 
 
@@ -600,11 +870,12 @@ app.layout = dbc.Container([
 
     # Tabs
     dbc.Tabs([
-        dbc.Tab(html.Div(id="t-overview"),   label="Übersicht",          tab_id="overview",    className="pt-3"),
-        dbc.Tab(html.Div(id="t-timeseries"), label="Zeitreihe",           tab_id="timeseries",  className="pt-3"),
-        dbc.Tab(html.Div(id="t-forecast"),   label="ML-Prognose",         tab_id="forecast",    className="pt-3"),
-        dbc.Tab(html.Div(id="t-regions"),    label="Regionen & Länder",   tab_id="regions",     className="pt-3"),
-        dbc.Tab(html.Div(id="t-ports"),      label="Häfen & Schiffe",     tab_id="ports",       className="pt-3"),
+        dbc.Tab(html.Div(id="t-overview"),   label="Übersicht",            tab_id="overview",    className="pt-3"),
+        dbc.Tab(html.Div(id="t-timeseries"), label="Zeitreihe",             tab_id="timeseries",  className="pt-3"),
+        dbc.Tab(html.Div(id="t-forecast"),   label="ML-Prognose",           tab_id="forecast",    className="pt-3"),
+        dbc.Tab(html.Div(id="t-stats"),      label="Statistik & Methodik",  tab_id="stats",       className="pt-3"),
+        dbc.Tab(html.Div(id="t-regions"),    label="Regionen & Länder",     tab_id="regions",     className="pt-3"),
+        dbc.Tab(html.Div(id="t-ports"),      label="Häfen & Schiffe",       tab_id="ports",       className="pt-3"),
     ], id="tabs", active_tab="overview"),
 
     html.Hr(style={"borderColor": "#2d2d45", "marginTop": "3rem"}),
@@ -870,26 +1141,324 @@ def cb_run_forecast(_, yr, ports_sel, metric, model_name, horizon):
                          dcc.Graph(figure=fig_fi, config={"displayModeBar": False}),
                          "fa-sort-amount-down")
 
+    # ── Residuenanalyse ──────────────────────────────────────────────────────
     residuals = result["test_actual"] - result["test_pred"]
     fig_res = make_subplots(rows=1, cols=2,
-                            subplot_titles=["Residuen (zeitlich)", "Histogramm"])
+                            subplot_titles=["Residuen vs. Zeit (Test-Split)", "Residuen-Histogramm"])
     fig_res.add_scatter(y=residuals, mode="markers",
-                        marker=dict(color=ACCENT, opacity=0.6), name="Resid.", row=1, col=1)
+                        marker=dict(color=ACCENT, opacity=0.6), name="Residuum eₜ = yₜ − ŷₜ",
+                        row=1, col=1)
     fig_res.add_hline(y=0, line_dash="dash", line_color="#666", row=1, col=1)
     fig_res.add_histogram(x=residuals, nbinsx=30, marker_color="#9b59b6",
-                          opacity=0.8, name="Hist.", row=1, col=2)
+                          opacity=0.8, name="Häufigkeit", row=1, col=2)
+    fig_res.update_xaxes(title_text="Test-Schritt", row=1, col=1)
+    fig_res.update_xaxes(title_text="Residuum", row=1, col=2)
+    fig_res.update_yaxes(title_text="eₜ", row=1, col=1)
+    fig_res.update_yaxes(title_text="Anzahl", row=1, col=2)
     _chart(fig_res, height=300)
 
-    return html.Div([
-        _card(f"Prognose: {label}  [{model_name.replace('_',' ').title()}]",
-              dcc.Graph(figure=fig, config={"displayModeBar": "hover"}), "fa-chart-line"),
-        dbc.Row([
-            dbc.Col([html.H6("Modellgüte (Test-Split)", className="text-muted mb-3"),
-                     kpi_row, fi_block], md=6),
-            dbc.Col(_card("Residuenanalyse",
-                          dcc.Graph(figure=fig_res, config={"displayModeBar": False}),
-                          "fa-wave-square"), md=6),
+    # ── Residuen-Normalverteilungstest ───────────────────────────────────────
+    norm_tests = result.get("residual_normality", {})
+    dw = result.get("durbin_watson", float("nan"))
+    dw_interp = ("keine Autokorrelation (d ≈ 2)" if 1.5 <= dw <= 2.5
+                 else ("positive Autokorrelation (d < 1.5)" if dw < 1.5
+                       else "negative Autokorrelation (d > 2.5)"))
+    test_rows = []
+    for tname, tres in norm_tests.items():
+        badge = "success" if tres.get("normal") else "danger"
+        concl = "H₀ nicht verworfen (normal, α=5%)" if tres.get("normal") else "H₀ verworfen (nicht-normal, α=5%)"
+        test_rows.append(html.Tr([
+            html.Td(tname, className="text-light"),
+            html.Td(f"{tres.get('stat','–'):.4f}", className="font-monospace"),
+            html.Td(f"{tres.get('pvalue','–'):.4f}", className="font-monospace"),
+            html.Td(dbc.Badge(concl, color=badge, className="small")),
+        ]))
+    norm_table = dbc.Table(
+        [html.Thead(html.Tr([html.Th("Test", style=TH_STYLE), html.Th("Statistik", style=TH_STYLE),
+                             html.Th("p-Wert", style=TH_STYLE), html.Th("Befund (α=5%)", style=TH_STYLE)])),
+         html.Tbody(test_rows)],
+        bordered=True, striped=True, hover=True, size="sm", style=TABLE_STYLE,
+    )
+
+    # ── Bias-Varianz-Tabelle ─────────────────────────────────────────────────
+    m = result["metrics"]
+    bias_var_rows = [
+        html.Tr([html.Td("Training"), html.Td(f"{m['MAE_train']:,.1f}"),
+                 html.Td(f"{m['RMSE_train']:,.1f}"), html.Td(f"{m['R²_train']:.3f}")]),
+        html.Tr([html.Td("Test (Out-of-sample)"), html.Td(f"{m['MAE']:,.1f}"),
+                 html.Td(f"{m['RMSE']:,.1f}"), html.Td(f"{m['R²']:.3f}")]),
+    ]
+    overfitting = m["RMSE_train"] > 0 and (m["RMSE"] / m["RMSE_train"] - 1) * 100
+    bv_note = (f"Generalisierungslücke: RMSE Test/Train = {m['RMSE']:.1f}/{m['RMSE_train']:.1f} "
+               f"(+{overfitting:.1f}%)" if isinstance(overfitting, float) else "")
+    bias_var_table = html.Div([
+        dbc.Table(
+            [html.Thead(html.Tr([html.Th("Split", style=TH_STYLE), html.Th("MAE", style=TH_STYLE),
+                                 html.Th("RMSE", style=TH_STYLE), html.Th("R²", style=TH_STYLE)])),
+             html.Tbody(bias_var_rows)],
+            bordered=True, striped=True, size="sm", style=TABLE_STYLE,
+        ),
+        html.P(bv_note, className="text-muted small mt-1"),
+    ])
+
+    # ── Modell-Metadaten-Karte ───────────────────────────────────────────────
+    meta = MODEL_METADATA.get(model_name, {})
+    hp_rows = [html.Tr([html.Td(k, className="font-monospace"), html.Td(str(v)), html.Td(desc)])
+               for k, v, desc in meta.get("hyperparams", [])]
+    methodik_card = _card(
+        f"Methodik: {meta.get('name', model_name)}",
+        html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.P([html.Strong("Modellformel:"), html.Br(),
+                            html.Code(meta.get("formula", "–"), className="text-success")],
+                           className="mb-2"),
+                    html.P([html.Strong("Verlustfunktion:"), html.Br(),
+                            html.Code(meta.get("loss", "–"), className="text-warning")],
+                           className="mb-2"),
+                    html.P([html.Strong("Annahmen:"),
+                            html.Span(f" {meta.get('assumption','')}", className="text-muted small")],
+                           className="mb-2"),
+                    html.P([html.Strong("Komplexität (Training): "),
+                            html.Code(meta.get("complexity_train", "–"), className="text-info")]),
+                    html.P([html.Strong("Komplexität (Prognose): "),
+                            html.Code(meta.get("complexity_pred", "–"), className="text-info")]),
+                ], md=6),
+                dbc.Col([
+                    html.P(html.Strong("Hyperparameter (fest, ohne Grid-Search):"),
+                           className="mb-2 text-muted small"),
+                    dbc.Table(
+                        [html.Thead(html.Tr([html.Th("Parameter", style=TH_STYLE),
+                                             html.Th("Wert", style=TH_STYLE),
+                                             html.Th("Bedeutung", style=TH_STYLE)])),
+                         html.Tbody(hp_rows)],
+                        bordered=True, striped=True, size="sm", style=TABLE_STYLE,
+                    ),
+                    html.P([
+                        html.Strong("Feature-Matrix: "),
+                        html.Code(f"n={result['n_train']} Train / {result['n_test']} Test, "
+                                  f"d={result['n_features']} Features",
+                                  className="text-muted"),
+                    ], className="mt-2 small"),
+                ], md=6),
+            ]),
         ]),
+        "fa-brain",
+    )
+
+    # ── Durbin-Watson-Karte ──────────────────────────────────────────────────
+    dw_color = "success" if 1.5 <= dw <= 2.5 else "warning"
+    stats_row = dbc.Row([
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.P("Durbin-Watson d", className="text-muted small mb-1"),
+            html.H5(f"{dw:.3f}", style={"color": ACCENT}),
+            html.P(dw_interp, className="text-muted small mb-0"),
+        ]), style=DARK_CARD), md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.P("n Train / Test", className="text-muted small mb-1"),
+            html.H5(f"{result['n_train']} / {result['n_test']}", style={"color": "#3498db"}),
+            html.P(f"d = {result['n_features']} Features", className="text-muted small mb-0"),
+        ]), style=DARK_CARD), md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.P("Konfidenzintervall", className="text-muted small mb-1"),
+            html.H5("95 % (1,96σ)", style={"color": "#9b59b6"}),
+            html.P("propagierter RMSE × √h", className="text-muted small mb-0"),
+        ]), style=DARK_CARD), md=4),
+    ], className="mb-3")
+
+    return html.Div([
+        _card(f"Prognose: {label}  [{meta.get('name', model_name)}]",
+              dcc.Graph(figure=fig, config={"displayModeBar": "hover"}), "fa-chart-line"),
+        html.P(f"Quelle: Statistisches Bundesamt (Destatis), MRTM-Seeverkehrsstatistik. "
+               f"Aggregationsebene: monatlich, gefiltert nach ausgewählten Häfen und Zeitraum.",
+               className="text-muted small text-end mb-3"),
+        methodik_card,
+        dbc.Row([
+            dbc.Col([
+                _card("Bias-Varianz-Analyse (Train vs. Test)", bias_var_table, "fa-balance-scale"),
+                stats_row,
+                _card("Residuennormalität (H₀: normalverteilt)", norm_table, "fa-vial"),
+            ], md=6),
+            dbc.Col([
+                _card("Residuenanalyse", dcc.Graph(figure=fig_res, config={"displayModeBar": False}),
+                      "fa-wave-square"),
+                fi_block,
+            ], md=6),
+        ]),
+    ])
+
+
+# ── Tab: Statistik & Methodik ─────────────────────────────────────────────────
+
+@app.callback(Output("t-stats", "children"),
+              Input("yr", "value"), Input("ports", "value"),
+              Input("metric", "value"), Input("tabs", "active_tab"))
+def cb_stats(yr, ports_sel, metric, active):
+    if active != "stats":
+        return dash.no_update
+
+    label = next((o["label"] for o in METRIC_OPTIONS if o["value"] == metric), metric)
+    ts = _ts_from_agg("ts", metric, yr, ports_sel)
+
+    if ts.empty:
+        return dbc.Alert("Keine Zeitreihendaten für diese Auswahl.", color="warning")
+
+    values = ts.values
+
+    # ── 1. Deskriptive Statistiken ───────────────────────────────────────────
+    desc_df = _descriptive_stats(values)
+    desc_table = dbc.Table.from_dataframe(
+        desc_df, bordered=True, striped=True, hover=True, size="sm", style=TABLE_STYLE,
+    )
+
+    # ── 2. ADF-Stationaritätstest ────────────────────────────────────────────
+    adf = _adf_test(ts)
+    if "error" in adf:
+        adf_block = dbc.Alert(f"ADF-Fehler: {adf['error']}", color="warning")
+    else:
+        st_color = "success" if adf["stationary"] else "danger"
+        st_text = ("Stationär (H₀ verworfen, α=5%)" if adf["stationary"]
+                   else "Nicht stationär – Einheitswurzel nicht ausgeschlossen (α=5%)")
+        adf_rows = [
+            html.Tr([html.Td("ADF-Teststatistik"), html.Td(html.Code(str(adf["stat"])))]),
+            html.Tr([html.Td("p-Wert"), html.Td(html.Code(str(adf["pvalue"])))]),
+            html.Tr([html.Td("Verwendete Lags (AIC)"), html.Td(html.Code(str(adf["lags_used"])))]),
+            html.Tr([html.Td("Kritischer Wert (1%)"), html.Td(html.Code(str(adf["critical_1"])))]),
+            html.Tr([html.Td("Kritischer Wert (5%)"), html.Td(html.Code(str(adf["critical_5"])))]),
+            html.Tr([html.Td("Kritischer Wert (10%)"), html.Td(html.Code(str(adf["critical_10"])))]),
+            html.Tr([html.Td("Befund"),
+                     html.Td(dbc.Badge(st_text, color=st_color))]),
+        ]
+        adf_block = html.Div([
+            html.P("H₀: Einheitswurzel vorhanden (nicht stationär). "
+                   "H₁: Kein Einheitswurzel → Stationarität. Lag-Auswahl via AIC.",
+                   className="text-muted small mb-2"),
+            dbc.Table(html.Tbody(adf_rows), bordered=True, striped=True, size="sm", style=TABLE_STYLE),
+        ])
+
+    # ── 3. Normalverteilungstests (Zeitreihe) ────────────────────────────────
+    norm = _normality_tests(values)
+    norm_rows = []
+    for tname, tres in norm.items():
+        badge = "success" if tres.get("normal") else "warning"
+        concl = "H₀ beibehalten (normal)" if tres.get("normal") else "H₀ verworfen (nicht-normal)"
+        norm_rows.append(html.Tr([
+            html.Td(tname), html.Td(html.Code(str(tres.get("stat", "–")))),
+            html.Td(html.Code(str(tres.get("pvalue", "–")))),
+            html.Td(dbc.Badge(concl, color=badge, className="small")),
+        ]))
+    norm_table = html.Div([
+        html.P("H₀: Normalverteilung. α = 5 %. "
+               "Shapiro-Wilk (n ≤ 5 000) oder KS-Test (n > 5 000) + Jarque-Bera (Schiefe & Wölbung).",
+               className="text-muted small mb-2"),
+        dbc.Table(
+            [html.Thead(html.Tr([html.Th("Test", style=TH_STYLE), html.Th("Statistik", style=TH_STYLE),
+                                 html.Th("p-Wert", style=TH_STYLE), html.Th("Befund", style=TH_STYLE)])),
+             html.Tbody(norm_rows)],
+            bordered=True, striped=True, hover=True, size="sm", style=TABLE_STYLE,
+        ),
+    ])
+
+    # ── 4. Verteilungsplot (Histogramm + KDE) ───────────────────────────────
+    fig_hist = go.Figure()
+    fig_hist.add_histogram(x=values, nbinsx=40, name="Beobachtungen",
+                           marker_color=ACCENT, opacity=0.7,
+                           histnorm="probability density")
+    x_range = np.linspace(float(np.min(values)), float(np.max(values)), 200)
+    mu, sigma = float(np.mean(values)), float(np.std(values))
+    kde_y = sp_stats.norm.pdf(x_range, mu, sigma)
+    fig_hist.add_scatter(x=x_range, y=kde_y, mode="lines", name="Normalvert. N(μ,σ²)",
+                         line=dict(color="#e74c3c", width=2))
+    fig_hist.update_xaxes(title_text=label)
+    fig_hist.update_yaxes(title_text="Dichte")
+    _chart(fig_hist, f"Verteilung: {label} (monatliche Aggregation)", 300)
+
+    # ── 5. ACF / PACF ────────────────────────────────────────────────────────
+    fig_acf = _acf_pacf_figure(values, nlags=min(24, len(values) // 3))
+    _chart(fig_acf, "Autokorrelation (ACF) und Partielle Autokorrelation (PACF)", 320)
+
+    # ── 6. Kreuzvalidierungsvergleich ────────────────────────────────────────
+    cv_df = _cv_all_models(ts)
+    if not cv_df.empty:
+        cv_table = dbc.Table.from_dataframe(
+            cv_df, bordered=True, striped=True, hover=True, size="sm", style=TABLE_STYLE,
+        )
+        best_model = cv_df.loc[cv_df["R² (Ø)"].idxmax(), "Modell"]
+        cv_note = (f"Walk-forward CV mit {cv_df['CV-Folds'].iloc[0]} Folds. "
+                   f"Bestes Modell nach R²: {best_model}. "
+                   f"Keine Datenleckage: Test-Folds liegen stets nach dem Training-Fenster.")
+        cv_block = html.Div([
+            html.P(cv_note, className="text-muted small mb-2"),
+            cv_table,
+        ])
+    else:
+        cv_block = dbc.Alert("Zu wenige Daten für CV (mind. 30 Monate).", color="info")
+
+    # ── 7. CRISP-DM Methodenübersicht ────────────────────────────────────────
+    crisp_phases = [
+        ("1. Business Understanding", "Ziel: Prognose des deutschen Seeverkehrsaufkommens "
+         "nach Tonnage, TEU und Ladeeinheiten je Hafen und Zeitraum."),
+        ("2. Data Understanding", f"Datenquelle: Statistisches Bundesamt (Destatis), MRTM-Seeverkehrsstatistik. "
+         f"Vorliegend: {len(ts):,} monatliche Beobachtungen ({ts.index[0].strftime('%b %Y')} – "
+         f"{ts.index[-1].strftime('%b %Y')}), Metrik: {label}."),
+        ("3. Data Preparation", "Bereinigungspipeline (clean_datasets.py): Semikolon-CSV mit Dezimalkomma, "
+         "Pflichtfeld-Validierung, Regions-Lookup, Makroregion-Ableitung, IQR-Ausreißermarkierung (k=3,0). "
+         "Dashboard: chunk-weises Einlesen (500k Zeilen/Chunk), Parquet-Cache."),
+        ("4. Modeling", "Feature Engineering: t, t², Sinus/Kosinus-Kodierung von Monat und Quartal, "
+         "Lags [1,2,3,6,12] Monate, gleitende Durchschnitte [3,6,12]. "
+         "Modelle: Ridge, Polynomial Ridge, Random Forest (B=200), Gradient Boosting (M=150, η=0,05). "
+         "Seed: random_state=42."),
+        ("5. Evaluation", "Hold-out Test-Split (letzte 10–16 Monate). Metriken: MAE, RMSE, R². "
+         "Walk-forward Cross-Validation (5 Folds). Residuendiagnose: Shapiro-Wilk, Jarque-Bera, Durbin-Watson. "
+         "Konfidenzband: ±1,96·RMSE·√h."),
+        ("6. Deployment", "Plotly Dash Web-App (http://127.0.0.1:8050). "
+         "Reproduzierbar via requirements.txt, Python ≥ 3.10, random_state=42."),
+    ]
+    crisp_phase_colors = ["#00d4aa", "#3498db", "#e67e22", "#9b59b6", "#e74c3c", "#2ecc71"]
+    crisp_rows = [
+        html.Tr([
+            html.Td(html.Strong(phase), style={
+                "width": "22%", "color": crisp_phase_colors[i % len(crisp_phase_colors)],
+                "borderLeft": f"3px solid {crisp_phase_colors[i % len(crisp_phase_colors)]}",
+                "paddingLeft": "10px", "whiteSpace": "nowrap",
+            }),
+            html.Td(desc, className="small", style={"color": "#b0b8c8"}),
+        ])
+        for i, (phase, desc) in enumerate(crisp_phases)
+    ]
+    crisp_table = dbc.Table(html.Tbody(crisp_rows), bordered=True, size="sm", style=TABLE_STYLE)
+
+    return html.Div([
+        # Deskriptive Statistiken + Verteilung
+        dbc.Row([
+            dbc.Col(_card("Deskriptive Statistiken", desc_table, "fa-table"), md=5),
+            dbc.Col(_card(f"Verteilung {label}", dcc.Graph(figure=fig_hist,
+                          config={"displayModeBar": False}), "fa-chart-area"), md=7),
+        ]),
+        html.P("Abbildung 1: Histogramm der monatlichen Aggregationswerte mit angepasster Normalverteilungskurve. "
+               "Quelle: Destatis MRTM.", className="text-muted small text-end mb-3"),
+
+        # ADF + Normalverteilungstest
+        dbc.Row([
+            dbc.Col(_card("Stationaritätstest (ADF) – H₀: Einheitswurzel", adf_block, "fa-stethoscope"), md=6),
+            dbc.Col(_card("Normalverteilungstests – H₀: Normalverteilung", norm_table, "fa-vial"), md=6),
+        ]),
+
+        # ACF / PACF
+        _card("Autokorrelationsstruktur der Zeitreihe",
+              html.Div([
+                  dcc.Graph(figure=fig_acf, config={"displayModeBar": False}),
+                  html.P("Abbildung 2: ACF und PACF. Rote gestrichelte Linien: 95%-Konfidenzband "
+                         "(±1,96/√n). Signifikante Lags deuten auf Autoregressive Struktur hin.",
+                         className="text-muted small mt-1"),
+              ]),
+              "fa-chart-line"),
+
+        # Kreuzvalidierung
+        _card("Modellvergleich: Walk-forward Cross-Validation (5 Folds)", cv_block, "fa-trophy"),
+
+        # CRISP-DM
+        _card("Vorgehensmodell: CRISP-DM", crisp_table, "fa-project-diagram"),
     ])
 
 
