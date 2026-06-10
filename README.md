@@ -1,132 +1,233 @@
 # Anwendungsprojekt-Seeschiffahrt
 
-Analyse und Prognose des Güterverkehrs in der Schiffahrt der Seefahrt.
+Analyse und Prognose des Güterverkehrs in der deutschen Seeschifffahrt auf Basis amtlicher Destatis-Statistiken.
 
 ---
 
-## Datenbereinigungs-Pipeline (`clean_datasets.py`)
+## Überblick
+
+Das Projekt besteht aus zwei Komponenten:
+
+| Komponente | Ordner | Zweck |
+|---|---|---|
+| Datenbereinigungs-Pipeline | `Dataset bereinigung/` | Rohdaten bereinigen und zusammenführen |
+| Analyse-Dashboard | `Dashboard/` | Interaktive Visualisierung und ML-Prognose |
+
+---
+
+## Schritt-für-Schritt-Tutorial
+
+### Voraussetzungen
+
+- Python 3.10 oder neuer
+- Die Rohdaten-CSV-Dateien von Destatis (MRTM-Datensätze)
+
+### Schritt 1 – Repository klonen
+
+```bash
+git clone https://github.com/MaksimRaabe/Anwendungsprojekt-Seeschiffahrt.git
+cd Anwendungsprojekt-Seeschiffahrt
+```
+
+### Schritt 2 – Abhängigkeiten installieren
+
+**Datenbereinigungs-Pipeline:**
+
+```bash
+pip install pandas numpy
+```
+
+**Dashboard:**
+
+```bash
+pip install -r Dashboard/requirements.txt
+```
+
+### Schritt 3 – Rohdaten ablegen
+
+Lege alle CSV-Rohdateien von Destatis in den Ordner:
+
+```
+Dataset bereinigung/Datasets/
+```
+
+Die Dateien müssen das Destatis-MRTM-Format aufweisen (UTF-8 mit BOM, Semikolon-getrennt, Dezimalkomma).
+Mehrere Jahresdateien können gleichzeitig im Ordner liegen — die Pipeline verarbeitet alle.
+
+### Schritt 4 – Datenbereinigungs-Pipeline ausführen
+
+```bash
+cd "Dataset bereinigung"
+python clean_datasets.py
+```
+
+Die Pipeline läuft parallel (bis zu 3 Prozesse) und gibt laufend Fortschritt aus.
+Laufzeit: ca. 1–5 Minuten je nach Datenmenge und Hardware.
+
+**Ausgaben nach erfolgreichem Lauf:**
+
+```
+Dataset bereinigung/
+├── Datasets_cleaned/
+│   └── seeverkehr_bereinigt_YYYYMMDD_HHMMSS.csv   ← bereinigte Gesamtdatei
+└── logs/
+    ├── cleaning_YYYYMMDD_HHMMSS.log                ← detailliertes Protokoll
+    └── cleaning_report_YYYYMMDD_HHMMSS.json        ← maschinenlesbarer Report
+```
+
+### Schritt 5 – Dashboard starten
+
+```bash
+cd Dashboard
+python dashboard.py
+```
+
+Beim ersten Start liest das Dashboard die bereinigte CSV chunkweise ein und baut einen
+Parquet-Cache auf (`Dashboard/.cache/`). Das dauert je nach Datenmenge 1–3 Minuten.
+Alle weiteren Starts laden den Cache direkt (wenige Sekunden).
+
+```
+Dashboard öffnen: http://127.0.0.1:8050
+```
+
+### Schritt 6 – Dashboard bedienen
+
+| Steuerelement | Funktion |
+|---|---|
+| Zeitraum-Slider | Jahrbereich einschränken (z. B. 2015–2023) |
+| Hafen-Dropdown | Einen oder mehrere deutsche Häfen auswählen (Standard: alle) |
+| Metrik | Tonnage (t), TEU (Container) oder Ladeeinheiten |
+
+**Tabs im Dashboard:**
+
+- **Übersicht** – Jährliche Gesamtentwicklung, Saisonalität, Verkehrsbeziehungen, Top-Güterklassen
+- **Zeitreihe** – Monatlicher Verlauf je Hafen mit Trendlinie
+- **ML-Prognose** – Vorhersage mit Random Forest, Gradient Boosting, linearer oder polynomialer Regression; wählbarer Prognosehorizont in Jahren
+- **Regionen & Länder** – Herkunfts- und Zielregionen (Makroregion und ISO-Länder); Sankey-Diagramm der Handelsströme
+- **Häfen & Schiffe** – Hafenvergleich, Schiffstypen, Flaggenverteilung
+
+---
+
+## Projektstruktur
+
+```
+Anwendungsprojekt-Seeschiffahrt/
+├── Dataset bereinigung/
+│   ├── Datasets/                        # Rohdaten (CSV, Destatis MRTM) – nicht im Repo
+│   ├── Datasets_cleaned/                # Bereinigte Ausgabedaten – nicht im Repo
+│   ├── logs/                            # Prozesslogs und JSON-Reports – nicht im Repo
+│   └── clean_datasets.py               # Datenbereinigungs-Pipeline
+├── Dashboard/
+│   ├── dashboard.py                     # Haupt-Dashboard-Applikation
+│   ├── requirements.txt                 # Python-Abhängigkeiten
+│   └── .cache/                          # Automatisch erstellter Parquet-Cache – nicht im Repo
+└── README.md
+```
+
+---
+
+## Datenbereinigungs-Pipeline – Details
 
 ### Ausgangssituation
 
-Die Rohdaten stammen aus dem **Destatis Open Data**-Angebot (Statistisches Bundesamt) zur Seeverkehrsstatistik (MRTM-Datensätze). Die CSV-Dateien liegen im Ordner `Datasets/` und haben folgendes Format:
+Die Rohdaten stammen aus dem **Destatis Open Data**-Angebot (Statistisches Bundesamt) zur Seeverkehrsstatistik (MRTM-Datensätze).
 
-| Eigenschaft       | Wert                  |
-|-------------------|-----------------------|
-| Kodierung         | UTF-8 mit BOM         |
-| Trennzeichen      | Semikolon (`;`)       |
-| Dezimalzeichen    | Komma (`,`)           |
+| Eigenschaft | Wert |
+|---|---|
+| Kodierung | UTF-8 mit BOM |
+| Trennzeichen | Semikolon (`;`) |
+| Dezimalzeichen | Komma (`,`) |
 
-Die Rohdaten können folgende Qualitätsprobleme aufweisen:
+Typische Qualitätsprobleme in den Rohdaten:
 
 - Fehlende Werte in Pflicht- und optionalen Feldern
 - Inkonsistente Spaltennamen je nach Datei-Version (z. B. `Guetergewicht` statt `Tonnen`)
 - Führende/nachgelagerte Leerzeichen in Textspalten
 - Ungültige oder außerhalb des erlaubten Bereichs liegende Codewerte
 - Doppelte Zeilen innerhalb und zwischen Dateien
-- Fehlende Regions-Zuordnungen (NUTS3, UNLOCODE) für Ein- und Ausladeregionen
-- Fehlende Makroregion-Zuordnung für Häfen außerhalb der EU/EEA
+- Fehlende Regions-Zuordnungen (NUTS3, UNLOCODE)
+- Fehlende Makroregion-Zuordnung für Nicht-EU/EEA-Häfen
 
----
-
-### Was die Pipeline tut (CRISP-DM – Data Preparation)
-
-Die Pipeline verarbeitet alle CSV-Dateien aus `Datasets/` parallel (bis zu 3 Prozesse gleichzeitig) und durchläuft für jede Datei folgende Schritte:
+### Verarbeitungsschritte (CRISP-DM – Data Preparation)
 
 #### 1. Einlesen
-Robustes Einlesen der CSV-Dateien (C-Engine mit Fallback auf Python-Engine bei fehlerhaften Zeilen). Spaltennamen werden vereinheitlicht (Alias-Mapping, z. B. `Guetergewicht` → `Tonnen`).
+Robustes Einlesen mit C-Engine, Fallback auf Python-Engine bei fehlerhaften Zeilen. Spaltennamen werden vereinheitlicht (Alias-Mapping, z. B. `Guetergewicht` → `Tonnen`).
 
-#### 2. Zeilen mit fehlenden Kernfeldern entfernen
-Zeilen, bei denen mindestens eines der folgenden Pflichtfelder fehlt, werden entfernt:
+#### 2. Pflichtfelder prüfen
+Zeilen mit fehlenden Kernfeldern werden entfernt:
 `EVAS`, `Referenzzeitraum_Jahr`, `Referenzzeitraum_Monat`, `Einladeregion_ISO`, `Ausladeregion_ISO`, `Verkehrsbeziehung`, `Schiffsart`, `Flagge`, `NST2007`, `Tonnen`
 
-#### 3. Pflichtfeld-Validierung
-Prüfung, ob alle erwarteten Pflichtfelder im Schema vorhanden sind. Fehlende Felder werden im Log als Warnung ausgewiesen.
-
-#### 4. Whitespace-Bereinigung
+#### 3. Whitespace-Bereinigung
 Führende und nachgelagerte Leerzeichen werden aus allen Textspalten entfernt.
 
-#### 5a. Ausladeregion-Auffüllung
-Fehlende Werte in `Ausladeregion_NUTS3`, `Ausladeregion_NUTS3_Label`, `Ausladeregion_UNLOCODE` und `Ausladeregion_HafenID` werden gegenseitig aufgefüllt. Anker-Spalte ist `Ausladeregion_HafenID`. Dabei werden lokale (dateibezogene) und globale (dateiübergreifende) Lookup-Tabellen kombiniert; lokale Mappings haben Vorrang.
+#### 4. Regions-Auffüllung
+Fehlende Werte in NUTS3-Codes, UNLOCODE und HafenID werden über dateiinterne und dateiübergreifende Lookup-Tabellen aufgefüllt. Lokale Mappings haben Vorrang.
 
-#### 5b. Einladeregion-Auffüllung
-Analog zur Ausladeregion für `Einladeregion_NUTS3`, `Einladeregion_NUTS3_Label`, `Einladeregion_UNLOCODE` und `Einladeregion_HafenID` (Anker: `Einladeregion_HafenID`).
-
-#### 5c. Makroregion-Ableitung
-Aus den ISO-2-Codes der Ein- und Ausladeregion werden die Spalten `Ausladeregion_Makroregion` und `Einladeregion_Makroregion` abgeleitet. Das Mapping deckt alle relevanten Weltregionen ab (EU/EEA, Nordafrika, Naher Osten, Asien, Amerika, Ozeanien u. a.). Unbekannte ISO-Codes bleiben `NaN` und werden im Report ausgewiesen.
+#### 5. Makroregion-Ableitung
+Aus den ISO-2-Codes werden `Einladeregion_Makroregion` und `Ausladeregion_Makroregion` abgeleitet (EU/EEA, Nordafrika, Naher Osten, Asien, Amerika, Ozeanien u. a.).
 
 #### 6. Numerische Konvertierung
-Die Spalten `Tonnen`, `TEU` und `Anzahl_Ladungstraeger` werden von String (Dezimalkomma) in Float konvertiert. Nicht konvertierbare Werte werden auf `NaN` gesetzt und im Report gezählt.
+`Tonnen`, `TEU` und `Anzahl_Ladungstraeger` werden von String (Dezimalkomma) in Float konvertiert. Nicht konvertierbare Werte werden als `NaN` markiert und protokolliert.
 
-#### 7. Fehlende-Werte-Analyse
-Verbleibende fehlende Werte werden protokolliert. Dabei wird unterschieden zwischen:
-- **Strukturell erwarteten** Lücken (z. B. fehlende NUTS3-Codes für Nicht-EU/EEA-Häfen)
-- **Unerwarteten** Lücken (z. B. EU/EEA-Hafen ohne NUTS3-Code → Warnung)
-- **Optionalen** Container-Feldern (nur relevant bei Containertransport)
+#### 7. Bereichsvalidierung
 
-#### 8. Bereichsvalidierung
-Codierte Felder werden auf erlaubte Wertebereiche geprüft:
+| Spalte | Erlaubter Bereich |
+|---|---|
+| `Referenzzeitraum_Monat` | 1 – 12 |
+| `Referenzzeitraum_Jahr` | 2000 – 2030 |
+| `Verkehrsbeziehung` | 1 – 4 |
 
-| Spalte                    | Erlaubter Bereich |
-|---------------------------|-------------------|
-| `Referenzzeitraum_Monat`  | 1 – 12            |
-| `Referenzzeitraum_Jahr`   | 2000 – 2030       |
-| `Verkehrsbeziehung`       | 1 – 4             |
-
-#### 9. ISO-Code-Validierung
+#### 8. ISO-Code-Validierung
 `Einladeregion_ISO`, `Ausladeregion_ISO` und `Flagge` werden auf das Format `[A-Z]{2}` geprüft.
 
-#### 10. Duplikaterkennung und -entfernung
-Exakt doppelte Zeilen werden innerhalb jeder Datei entfernt. Nach dem Zusammenführen aller Dateien werden dateiübergreifende Duplikate (ohne Berücksichtigung der `Quelldatei`-Spalte) nochmals entfernt.
+#### 9. Duplikaterkennung
+Exakt doppelte Zeilen werden innerhalb jeder Datei und nach dem Zusammenführen dateiübergreifend entfernt.
 
-#### 11. Ausreißer-Markierung (IQR-Methode)
-Für `Tonnen`, `TEU` und `Anzahl_Ladungstraeger` werden Ausreißer mit dem Faktor 3,0 × IQR markiert (nicht entfernt). Pro Spalte wird eine boolesche Spalte `*_outlier` hinzugefügt.
+#### 10. Ausreißer-Markierung (IQR-Methode)
+Für `Tonnen`, `TEU` und `Anzahl_Ladungstraeger` werden Ausreißer mit Faktor 3,0 × IQR markiert (nicht entfernt). Neue boolesche Spalten: `Tonnen_outlier`, `TEU_outlier`, `Anzahl_Ladungstraeger_outlier`.
 
----
+### Ausgabe-Format
 
-### Dateiübergreifende Lookup-Tabellen
+Die bereinigte CSV hat dasselbe Format wie die Eingabe (UTF-8 mit BOM, Semikolon, Dezimalkomma) und enthält zusätzliche Spalten:
 
-Vor der Parallelverarbeitung werden alle CSV-Dateien einmalig eingelesen, um **globale Lookup-Tabellen** für die Regions-Auffüllung aufzubauen. So können Regions-Zuordnungen, die nur in einer Datei vorkommen, auch auf andere Dateien angewendet werden.
-
----
-
-### Ergebnisse
-
-Am Ende der Pipeline entstehen folgende Ausgaben:
-
-#### `Datasets_cleaned/`
-Eine bereinigte, kombinierte CSV-Datei mit dem Namen:
-```
-seeverkehr_bereinigt_YYYYMMDD_HHMMSS.csv
-```
-- Gleiches Format wie die Eingabe (UTF-8 mit BOM, Semikolon, Dezimalkomma)
-- Enthält eine zusätzliche Spalte `Quelldatei` (Herkunft jeder Zeile)
-- Enthält neue Spalten `Ausladeregion_Makroregion` und `Einladeregion_Makroregion`
-- Enthält Ausreißer-Markierungsspalten (`Tonnen_outlier`, `TEU_outlier`, `Anzahl_Ladungstraeger_outlier`)
-
-#### `logs/`
-Zwei Dateien pro Lauf:
-
-| Datei                                        | Inhalt                                                                 |
-|----------------------------------------------|------------------------------------------------------------------------|
-| `cleaning_YYYYMMDD_HHMMSS.log`               | Detailliertes Prozessprotokoll (Info, Warnungen, Fehler)              |
-| `cleaning_report_YYYYMMDD_HHMMSS.json`       | Maschinenlesbarer Report mit Kennzahlen je Datei und Gesamtstatistik  |
-
-Der JSON-Report enthält je Datei u. a.:
-- Ursprüngliche und finale Shape (Zeilen × Spalten)
-- Anzahl entfernter Zeilen (fehlende Kernfelder, Duplikate)
-- Anzahl ergänzter Regions-Werte
-- Konvertierungsfehler, Bereichsverletzungen, ISO-Fehler
-- Ausreißer-Statistiken (Q1, Q3, Grenzen) pro numerischer Spalte
-- Makroregion-Mapping-Statistik
+| Neue Spalte | Inhalt |
+|---|---|
+| `Quelldatei` | Name der Ursprungsdatei |
+| `Einladeregion_Makroregion` | Abgeleitete Weltregion der Einladung |
+| `Ausladeregion_Makroregion` | Abgeleitete Weltregion der Ausladung |
+| `Tonnen_outlier` | `True` wenn Ausreißer |
+| `TEU_outlier` | `True` wenn Ausreißer |
+| `Anzahl_Ladungstraeger_outlier` | `True` wenn Ausreißer |
 
 ---
 
-### Projektstruktur
+## Dashboard – Technische Details
 
-```
-Anwendungsprojekt-Seeschiffahrt/
-├── Datasets/                  # Rohdaten (CSV, Destatis MRTM)
-├── Datasets_cleaned/          # Bereinigte Ausgabedaten
-├── logs/                      # Prozesslogs und JSON-Reports
-└── clean_datasets.py          # Datenbereinigungs-Pipeline
+### Architektur
+
+Das Dashboard ist für große Dateien (bis ~10 Mio. Zeilen / 3,5 GB CSV) ausgelegt:
+
+1. **Chunk-Verarbeitung**: CSV wird in 500k-Zeilen-Chunks eingelesen – nie vollständig im RAM
+2. **Aggregation beim Einlesen**: Alle Kennzahlen werden direkt je Chunk akkumuliert; Rohdaten werden nicht gespeichert
+3. **Parquet-Cache**: Aggregationen werden als kompakte Parquet-Dateien gecacht (~MB statt GB); Folgestarts laden nur den Cache
+4. **Callbacks auf Agg-Daten**: Alle Dashboard-Interaktionen arbeiten ausschließlich auf den kleinen Aggregationstabellen
+
+### Bekannte Fixes (Stand Juni 2026)
+
+| Problem | Ursache | Lösung |
+|---|---|---|
+| Tonnage/TEU zeigt 0 | CSV-Zahlen mit Dezimalkomma (`342,0`) wurden von `pd.to_numeric` nicht erkannt | Komma wird vor Konvertierung durch Punkt ersetzt |
+| Jahresfilter TypeError | `Referenzzeitraum_Jahr` liegt als String im Cache; Vergleich mit `int` schlug fehl | `pd.to_numeric` beim Filtern in `_agg()` |
+| ML-Prognose-Tab 500-Fehler | `add_vline` mit `annotation_position` + Timestamp-x erzeugt internen Plotly-Fehler | Ersetzt durch `add_shape` + `add_annotation` |
+
+### Cache invalidieren
+
+Falls die bereinigte CSV ausgetauscht wird, erkennt das Dashboard automatisch die Änderung (anhand des Datei-Timestamps) und baut den Cache neu. Manuelles Löschen ist möglich:
+
+```bash
+# Windows
+del /q Dashboard\.cache\*
+
+# Linux / macOS
+rm Dashboard/.cache/*
 ```
