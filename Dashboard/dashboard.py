@@ -87,6 +87,7 @@ AGG_DIMS: dict[str, list[str]] = {
                     "Einladeregion_Makroregion", "Ausladeregion_Makroregion"],
 }
 
+
 METRIC_OPTIONS = [
     {"label": "Tonnage (t)",      "value": "Tonnen"},
     {"label": "TEU (Container)",  "value": "TEU"},
@@ -102,6 +103,20 @@ MODEL_OPTIONS = [
 ACCENT = "#00d4aa"
 DARK_CARD = {"background": "#1e1e30", "border": "1px solid #2d2d45"}
 CHART_TPL = "plotly_dark"
+
+# Standard-Konfiguration für alle Charts: PNG-Download-Button sichtbar
+GRAPH_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
+    "toImageButtonOptions": {
+        "format": "svg",
+        "filename": "seeverkehr_chart",
+        "height": 600,
+        "width": 1200,
+        "scale": 2,          # 2× → hochauflösend (2400×1200 px)
+    },
+}
 TABLE_STYLE = {
     "--bs-table-bg": "#13132a",
     "--bs-table-striped-bg": "#191930",
@@ -385,6 +400,7 @@ def _ts_from_agg(agg_name: str, metric: str, years_range: list, ports_sel: list)
         errors="coerce",
     )
     return grouped.sort_index().dropna()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -966,15 +982,15 @@ def cb_overview(yr, ports_sel, metric, active):
     return html.Div([
         dbc.Row([
             dbc.Col(_card("Jährliche Entwicklung",
-                          dcc.Graph(figure=fig_yr, config={"displayModeBar": False}), "fa-chart-bar"), md=8),
+                          dcc.Graph(figure=fig_yr, config=GRAPH_CONFIG), "fa-chart-bar"), md=8),
             dbc.Col(_card("Saisonalität",
-                          dcc.Graph(figure=fig_mo, config={"displayModeBar": False}), "fa-calendar"), md=4),
+                          dcc.Graph(figure=fig_mo, config=GRAPH_CONFIG), "fa-calendar"), md=4),
         ]),
         dbc.Row([
             dbc.Col(_card("Verkehrsrichtung",
-                          dcc.Graph(figure=fig_vk, config={"displayModeBar": False}), "fa-exchange-alt"), md=4),
+                          dcc.Graph(figure=fig_vk, config=GRAPH_CONFIG), "fa-exchange-alt"), md=4),
             dbc.Col(_card("Güterklassen NST2007",
-                          dcc.Graph(figure=fig_nst, config={"displayModeBar": False}), "fa-boxes"), md=8),
+                          dcc.Graph(figure=fig_nst, config=GRAPH_CONFIG), "fa-boxes"), md=8),
         ]),
     ])
 
@@ -1036,12 +1052,12 @@ def cb_timeseries(yr, ports_sel, metric, active):
 
     return html.Div([
         _card("Zeitreihe mit gleitenden Durchschnitten",
-              dcc.Graph(figure=fig, config={"displayModeBar": "hover"}), "fa-chart-line"),
+              dcc.Graph(figure=fig, config=GRAPH_CONFIG), "fa-chart-line"),
         dbc.Row([
             dbc.Col(_card("Saisonale Heatmap",
-                          dcc.Graph(figure=fig_hm, config={"displayModeBar": False}), "fa-th"), md=7),
+                          dcc.Graph(figure=fig_hm, config=GRAPH_CONFIG), "fa-th"), md=7),
             dbc.Col(_card("YoY Wachstum",
-                          dcc.Graph(figure=fig_gr, config={"displayModeBar": False}), "fa-percent"), md=5),
+                          dcc.Graph(figure=fig_gr, config=GRAPH_CONFIG), "fa-percent"), md=5),
         ]),
     ])
 
@@ -1138,7 +1154,7 @@ def cb_run_forecast(_, yr, ports_sel, metric, model_name, horizon):
                         color="Importance", color_continuous_scale="Teal")
         _chart(fig_fi, "Feature Importance", 340)
         fi_block = _card("Feature Importance",
-                         dcc.Graph(figure=fig_fi, config={"displayModeBar": False}),
+                         dcc.Graph(figure=fig_fi, config=GRAPH_CONFIG),
                          "fa-sort-amount-down")
 
     # ── Residuenanalyse ──────────────────────────────────────────────────────
@@ -1268,7 +1284,7 @@ def cb_run_forecast(_, yr, ports_sel, metric, model_name, horizon):
 
     return html.Div([
         _card(f"Prognose: {label}  [{meta.get('name', model_name)}]",
-              dcc.Graph(figure=fig, config={"displayModeBar": "hover"}), "fa-chart-line"),
+              dcc.Graph(figure=fig, config=GRAPH_CONFIG), "fa-chart-line"),
         html.P(f"Quelle: Statistisches Bundesamt (Destatis), MRTM-Seeverkehrsstatistik. "
                f"Aggregationsebene: monatlich, gefiltert nach ausgewählten Häfen und Zeitraum.",
                className="text-muted small text-end mb-3"),
@@ -1280,7 +1296,7 @@ def cb_run_forecast(_, yr, ports_sel, metric, model_name, horizon):
                 _card("Residuennormalität (H₀: normalverteilt)", norm_table, "fa-vial"),
             ], md=6),
             dbc.Col([
-                _card("Residuenanalyse", dcc.Graph(figure=fig_res, config={"displayModeBar": False}),
+                _card("Residuenanalyse", dcc.Graph(figure=fig_res, config=GRAPH_CONFIG),
                       "fa-wave-square"),
                 fi_block,
             ], md=6),
@@ -1394,71 +1410,17 @@ def cb_stats(yr, ports_sel, metric, active):
     else:
         cv_block = dbc.Alert("Zu wenige Daten für CV (mind. 30 Monate).", color="info")
 
-    # ── 7. CRISP-DM Methodenübersicht ────────────────────────────────────────
-    crisp_phases = [
-        ("1. Business Understanding", "Ziel: Prognose des deutschen Seeverkehrsaufkommens "
-         "nach Tonnage, TEU und Ladeeinheiten je Hafen und Zeitraum."),
-        ("2. Data Understanding", f"Datenquelle: Statistisches Bundesamt (Destatis), MRTM-Seeverkehrsstatistik. "
-         f"Vorliegend: {len(ts):,} monatliche Beobachtungen ({ts.index[0].strftime('%b %Y')} – "
-         f"{ts.index[-1].strftime('%b %Y')}), Metrik: {label}."),
-        ("3. Data Preparation", "Bereinigungspipeline (clean_datasets.py): Semikolon-CSV mit Dezimalkomma, "
-         "Pflichtfeld-Validierung, Regions-Lookup, Makroregion-Ableitung, IQR-Ausreißermarkierung (k=3,0). "
-         "Dashboard: chunk-weises Einlesen (500k Zeilen/Chunk), Parquet-Cache."),
-        ("4. Modeling", "Feature Engineering: t, t², Sinus/Kosinus-Kodierung von Monat und Quartal, "
-         "Lags [1,2,3,6,12] Monate, gleitende Durchschnitte [3,6,12]. "
-         "Modelle: Ridge, Polynomial Ridge, Random Forest (B=200), Gradient Boosting (M=150, η=0,05). "
-         "Seed: random_state=42."),
-        ("5. Evaluation", "Hold-out Test-Split (letzte 10–16 Monate). Metriken: MAE, RMSE, R². "
-         "Walk-forward Cross-Validation (5 Folds). Residuendiagnose: Shapiro-Wilk, Jarque-Bera, Durbin-Watson. "
-         "Konfidenzband: ±1,96·RMSE·√h."),
-        ("6. Deployment", "Plotly Dash Web-App (http://127.0.0.1:8050). "
-         "Reproduzierbar via requirements.txt, Python ≥ 3.10, random_state=42."),
-    ]
-    crisp_phase_colors = ["#00d4aa", "#3498db", "#e67e22", "#9b59b6", "#e74c3c", "#2ecc71"]
-    crisp_rows = [
-        html.Tr([
-            html.Td(html.Strong(phase), style={
-                "width": "22%", "color": crisp_phase_colors[i % len(crisp_phase_colors)],
-                "borderLeft": f"3px solid {crisp_phase_colors[i % len(crisp_phase_colors)]}",
-                "paddingLeft": "10px", "whiteSpace": "nowrap",
-            }),
-            html.Td(desc, className="small", style={"color": "#b0b8c8"}),
-        ])
-        for i, (phase, desc) in enumerate(crisp_phases)
-    ]
-    crisp_table = dbc.Table(html.Tbody(crisp_rows), bordered=True, size="sm", style=TABLE_STYLE)
-
     return html.Div([
-        # Deskriptive Statistiken + Verteilung
         dbc.Row([
             dbc.Col(_card("Deskriptive Statistiken", desc_table, "fa-table"), md=5),
-            dbc.Col(_card(f"Verteilung {label}", dcc.Graph(figure=fig_hist,
-                          config={"displayModeBar": False}), "fa-chart-area"), md=7),
+            dbc.Col(_card("ADF-Stationaritätstest", adf_block, "fa-flask"), md=7),
         ]),
-        html.P("Abbildung 1: Histogramm der monatlichen Aggregationswerte mit angepasster Normalverteilungskurve. "
-               "Quelle: Destatis MRTM.", className="text-muted small text-end mb-3"),
-
-        # ADF + Normalverteilungstest
         dbc.Row([
-            dbc.Col(_card("Stationaritätstest (ADF) – H₀: Einheitswurzel", adf_block, "fa-stethoscope"), md=6),
-            dbc.Col(_card("Normalverteilungstests – H₀: Normalverteilung", norm_table, "fa-vial"), md=6),
+            dbc.Col(_card("Normalverteilungstests", norm_table, "fa-vial"), md=6),
+            dbc.Col(_card("Verteilungsplot", dcc.Graph(figure=fig_hist, config=GRAPH_CONFIG), "fa-chart-bar"), md=6),
         ]),
-
-        # ACF / PACF
-        _card("Autokorrelationsstruktur der Zeitreihe",
-              html.Div([
-                  dcc.Graph(figure=fig_acf, config={"displayModeBar": False}),
-                  html.P("Abbildung 2: ACF und PACF. Rote gestrichelte Linien: 95%-Konfidenzband "
-                         "(±1,96/√n). Signifikante Lags deuten auf Autoregressive Struktur hin.",
-                         className="text-muted small mt-1"),
-              ]),
-              "fa-chart-line"),
-
-        # Kreuzvalidierung
-        _card("Modellvergleich: Walk-forward Cross-Validation (5 Folds)", cv_block, "fa-trophy"),
-
-        # CRISP-DM
-        _card("Vorgehensmodell: CRISP-DM", crisp_table, "fa-project-diagram"),
+        _card("ACF & PACF", dcc.Graph(figure=fig_acf, config=GRAPH_CONFIG), "fa-wave-square"),
+        _card("Modellvergleich (Walk-forward Kreuzvalidierung)", cv_block, "fa-balance-scale"),
     ])
 
 
@@ -1517,16 +1479,16 @@ def cb_regions(yr, ports_sel, metric, active):
         ))
         _chart(fig_sk, f"Handelsstrom: Einladung → Ausladung ({label})", 460)
         sankey_block = _card("Handelsstrom-Sankey",
-                             dcc.Graph(figure=fig_sk, config={"displayModeBar": False}),
+                             dcc.Graph(figure=fig_sk, config=GRAPH_CONFIG),
                              "fa-project-diagram")
 
     return html.Div([
         dbc.Row([
             dbc.Col(_card("Makroregionen (Einladung)",
-                          dcc.Graph(figure=fig_ein, config={"displayModeBar": False}),
+                          dcc.Graph(figure=fig_ein, config=GRAPH_CONFIG),
                           "fa-globe-europe"), md=5),
             dbc.Col(_card("Top-20 Länder",
-                          dcc.Graph(figure=fig_iso, config={"displayModeBar": False}),
+                          dcc.Graph(figure=fig_iso, config=GRAPH_CONFIG),
                           "fa-flag"), md=7),
         ]),
         sankey_block,
@@ -1596,21 +1558,21 @@ def cb_ports(yr, ports_sel, metric, active):
                          color_discrete_sequence=px.colors.qualitative.Bold)
         _chart(fig_ts, "Top-5 Häfen im Zeitverlauf", 380)
         ts_block = _card("Hafenentwicklung",
-                         dcc.Graph(figure=fig_ts, config={"displayModeBar": "hover"}),
+                         dcc.Graph(figure=fig_ts, config=GRAPH_CONFIG),
                          "fa-chart-area")
 
     return html.Div([
         dbc.Row([
             dbc.Col(_card("Häfen-Ranking",
-                          dcc.Graph(figure=fig_hp, config={"displayModeBar": False}),
+                          dcc.Graph(figure=fig_hp, config=GRAPH_CONFIG),
                           "fa-anchor"), md=7),
             dbc.Col(_card("Schiffsarten",
-                          dcc.Graph(figure=fig_sh, config={"displayModeBar": False}),
+                          dcc.Graph(figure=fig_sh, config=GRAPH_CONFIG),
                           "fa-ship"), md=5),
         ]),
         dbc.Row([
             dbc.Col(_card("Flaggenstaaten",
-                          dcc.Graph(figure=fig_fl, config={"displayModeBar": False}),
+                          dcc.Graph(figure=fig_fl, config=GRAPH_CONFIG),
                           "fa-flag"), md=5),
             dbc.Col(ts_block, md=7),
         ]),
